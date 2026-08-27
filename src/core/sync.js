@@ -18,7 +18,7 @@ function readPositiveIntEnv(name, fallback) {
 
 const CONCURRENCY = readPositiveIntEnv(
   "AETHEL_TRANSFER_CONCURRENCY",
-  readPositiveIntEnv("AETHEL_DRIVE_CONCURRENCY", 20)
+  readPositiveIntEnv("AETHEL_DRIVE_CONCURRENCY", 32)
 );
 const CHILD_INDEX_UPLOAD_THRESHOLD = readPositiveIntEnv(
   "AETHEL_CHILD_INDEX_UPLOAD_THRESHOLD",
@@ -253,14 +253,23 @@ async function uploadStagedFile(drive, entry, root, driveFolderId, snapshot, con
       }
       throw err;
     }
+    const fileStableDuringUpload =
+      postUploadStat.size === localStat.size &&
+      postUploadStat.mtimeMs === localStat.mtimeMs;
     const stagedMetadataMatches =
       entry.localMd5 &&
       entry.localSize === localStat.size &&
       entry.localModifiedTime === currentModifiedTime &&
-      postUploadStat.size === localStat.size &&
-      postUploadStat.mtimeMs === localStat.mtimeMs;
+      fileStableDuringUpload;
 
     let localMd5 = stagedMetadataMatches ? entry.localMd5 : null;
+    // The upload already hashed every byte it sent, so a file that did not
+    // move under us needs no second full read to verify. A file that did
+    // change still gets re-hashed, so an edit mid-upload fails the commit as
+    // before rather than being papered over.
+    if (!localMd5 && fileStableDuringUpload && uploadResult.aethelStreamMd5) {
+      localMd5 = uploadResult.aethelStreamMd5;
+    }
     if (!localMd5) {
       try {
         localMd5 = await md5Local(localAbsolutePath);
@@ -483,6 +492,21 @@ async function deleteRemoteFile(drive, entry, snapshot, driveFolderId) {
 
 // ── Bounded-concurrency runner ───────────────────────────────────────
 
+/**
+ * Scheduling weight for a staged remote operation — higher starts sooner.
+ * Metadata-only work and packs of unknown size go first, then real transfers
+ * ordered by how long they are likely to occupy a slot.
+ */
+function remoteOpWeight(entry) {
+  if (entry.isFolder) return Number.POSITIVE_INFINITY;
+  if (entry.action === "delete_remote") return Number.POSITIVE_INFINITY;
+  if (entry.action === "push_pack" || entry.action === "pull_pack") {
+    return Number.POSITIVE_INFINITY;
+  }
+  const size = entry.localSize ?? entry.remoteSize;
+  return Number.isFinite(size) ? size : 0;
+}
+
 async function runConcurrent(tasks, limit, onDone) {
   let next = 0;
   let running = 0;
@@ -668,6 +692,16 @@ export async function executeStaged(drive, root, progress) {
       result.errors.push(`delete_local ${entry.path}: ${err.message}`);
     }
   }
+
+  // Fill the pool largest-first. A FIFO pool that happens to start a multi-GB
+  // file last leaves it transferring alone long after every other slot has
+  // drained; starting it first overlaps it with all the small work. Metadata-
+  // only operations sort ahead of everything: they finish almost immediately
+  // and folder creation warms the shared folder cache for concurrent uploads.
+  // The sort is stable, so entries of equal weight keep their staged order.
+  remoteOps.sort(
+    (left, right) => remoteOpWeight(right.entry) - remoteOpWeight(left.entry)
+  );
 
   // Run remote operations with bounded concurrency
   const tasks = remoteOps.map(({ entry }) => {

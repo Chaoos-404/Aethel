@@ -228,44 +228,58 @@ export async function scanLocal(root, { respectIgnore = true, respectPacking = t
     left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0
   );
 
-  // Phase 2: hash files in parallel batches, using cache when possible
+  // Phase 2: hash files with a continuously refilled pool, using cache when
+  // possible. Fixed batches made every cache hit — which costs nothing — wait
+  // for the slowest cold file in its group of 128 before any further file
+  // started. Workers pull from a shared cursor instead, so a slot is busy
+  // exactly as long as it takes to hash one file.
   const result = {};
+  const hashes = new Array(filesToHash.length);
+  let nextFileIndex = 0;
 
-  for (let i = 0; i < filesToHash.length; i += PARALLEL_HASH_LIMIT) {
-    const batch = filesToHash.slice(i, i + PARALLEL_HASH_LIMIT);
-    const hashes = await Promise.all(
-      batch.map(async ({ fullPath, relativePath, stat }) => {
-        try {
-          const { md5, fromCache } = await getMd5Cached(
-            hashCache,
-            nextCache,
-            fullPath,
-            relativePath,
-            stat
-          );
-          if (!fromCache) hashCacheDirty = true;
-          return { relativePath, stat, md5 };
-        } catch (err) {
-          if (isMissingLocalFileError(err)) {
-            return null;
-          }
+  async function hashWorker() {
+    for (;;) {
+      const currentIndex = nextFileIndex++;
+      if (currentIndex >= filesToHash.length) return;
+      const { fullPath, relativePath, stat } = filesToHash[currentIndex];
+      try {
+        const { md5, fromCache } = await getMd5Cached(
+          hashCache,
+          nextCache,
+          fullPath,
+          relativePath,
+          stat
+        );
+        if (!fromCache) hashCacheDirty = true;
+        hashes[currentIndex] = { relativePath, stat, md5 };
+      } catch (err) {
+        if (!isMissingLocalFileError(err)) {
           throw err;
         }
-      })
-    );
-
-    for (const hashResult of hashes) {
-      if (!hashResult) {
-        continue;
       }
-      const { relativePath, stat, md5 } = hashResult;
-      result[relativePath] = {
-        localPath: relativePath,
-        size: stat.size,
-        md5,
-        modifiedTime: new Date(stat.mtimeMs).toISOString(),
-      };
     }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(PARALLEL_HASH_LIMIT, filesToHash.length) },
+      hashWorker
+    )
+  );
+
+  // Results land in `filesToHash` order, so `result` keeps the sorted
+  // insertion order that change reporting depends on.
+  for (const hashResult of hashes) {
+    if (!hashResult) {
+      continue;
+    }
+    const { relativePath, stat, md5 } = hashResult;
+    result[relativePath] = {
+      localPath: relativePath,
+      size: stat.size,
+      md5,
+      modifiedTime: new Date(stat.mtimeMs).toISOString(),
+    };
   }
 
   // Phase 3: detect empty folders (directories with zero tracked children)

@@ -31,6 +31,13 @@ function changeToEntry(change) {
     entry.remoteMd5Checksum = change.remoteMeta.md5Checksum;
   }
 
+  // Drive reports size as a string; the executor uses it to start the largest
+  // transfers first.
+  const remoteSize = Number(change.remoteMeta?.size);
+  if (Number.isFinite(remoteSize) && remoteSize > 0) {
+    entry.remoteSize = remoteSize;
+  }
+
   if (change.localMeta?.md5) {
     entry.localMd5 = change.localMeta.md5;
   }
@@ -78,21 +85,27 @@ export function stageChanges(root, changes) {
   return changes.length;
 }
 
+function remoteFileToDownloadEntry(remoteFile) {
+  const remoteSize = Number(remoteFile.size);
+  return {
+    action: "download",
+    path: remoteFile.path,
+    localPath: remoteFile.path,
+    fileId: remoteFile.id,
+    remotePath: remoteFile.path,
+    ...(remoteFile.mimeType ? { remoteMimeType: remoteFile.mimeType } : {}),
+    ...(remoteFile.md5Checksum ? { remoteMd5Checksum: remoteFile.md5Checksum } : {}),
+    ...(Number.isFinite(remoteSize) && remoteSize > 0 ? { remoteSize } : {}),
+    ...(remoteFile.isFolder ? { isFolder: true } : {}),
+  };
+}
+
 export function stageRemoteFilesForDownload(root, remoteFiles) {
   const index = readIndex(root);
   const byPath = new Map((index.staged || []).map((entry) => [entry.path, entry]));
 
   for (const remoteFile of remoteFiles) {
-    byPath.set(remoteFile.path, {
-      action: "download",
-      path: remoteFile.path,
-      localPath: remoteFile.path,
-      fileId: remoteFile.id,
-      remotePath: remoteFile.path,
-      ...(remoteFile.mimeType ? { remoteMimeType: remoteFile.mimeType } : {}),
-      ...(remoteFile.md5Checksum ? { remoteMd5Checksum: remoteFile.md5Checksum } : {}),
-      ...(remoteFile.isFolder ? { isFolder: true } : {}),
-    });
+    byPath.set(remoteFile.path, remoteFileToDownloadEntry(remoteFile));
   }
 
   index.staged = [...byPath.values()];
@@ -116,16 +129,7 @@ export function stageFullRemotePull(
   const byPath = new Map((index.staged || []).map((entry) => [entry.path, entry]));
 
   for (const remoteFile of remoteFiles) {
-    byPath.set(remoteFile.path, {
-      action: "download",
-      path: remoteFile.path,
-      localPath: remoteFile.path,
-      fileId: remoteFile.id,
-      remotePath: remoteFile.path,
-      ...(remoteFile.mimeType ? { remoteMimeType: remoteFile.mimeType } : {}),
-      ...(remoteFile.md5Checksum ? { remoteMd5Checksum: remoteFile.md5Checksum } : {}),
-      ...(remoteFile.isFolder ? { isFolder: true } : {}),
-    });
+    byPath.set(remoteFile.path, remoteFileToDownloadEntry(remoteFile));
   }
 
   for (const change of remoteDeletions) {

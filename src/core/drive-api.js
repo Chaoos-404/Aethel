@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import crypto from "node:crypto";
 import path from "node:path";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { findRoot } from "./config.js";
 import { loadIgnoreRules } from "./ignore.js";
@@ -68,22 +68,52 @@ async function withRetry(fn) {
   }
 }
 
-/**
- * Return a thin wrapper around a googleapis drive client whose
- * `files.*` methods automatically retry on 429 / 5xx.
- * The original object is not mutated.
- */
-export function withDriveRetry(drive) {
-  const filesProxy = new Proxy(drive.files, {
+function hasStreamMediaBody(args) {
+  const body = args[0]?.media?.body;
+  return Boolean(body) && typeof body.pipe === "function";
+}
+
+function retryNamespace(namespace) {
+  return new Proxy(namespace, {
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver);
       if (typeof value !== "function") return value;
-      return (...args) => withRetry(() => value.apply(target, args));
+      return (...args) => {
+        // A read stream cannot be replayed once consumed: retrying here would
+        // re-send an empty body. Uploads own their retry instead, rebuilding
+        // the media for every attempt (see uploadFile).
+        if (hasStreamMediaBody(args)) return value.apply(target, args);
+        return withRetry(() => value.apply(target, args));
+      };
     },
   });
-  return Object.create(drive, {
-    files: { value: filesProxy, configurable: true, enumerable: true },
-  });
+}
+
+/**
+ * Return a thin wrapper around a googleapis drive client whose
+ * `files.*`, `changes.*` and `about.*` methods automatically retry on
+ * 429 / 5xx. The original object is not mutated.
+ */
+export function withDriveRetry(drive) {
+  const descriptors = {
+    files: {
+      value: retryNamespace(drive.files),
+      configurable: true,
+      enumerable: true,
+    },
+  };
+  // Delta sync and account lookups deserve the same backoff, but test doubles
+  // often only implement `files`.
+  for (const name of ["changes", "about"]) {
+    if (drive[name]) {
+      descriptors[name] = {
+        value: retryNamespace(drive[name]),
+        configurable: true,
+        enumerable: true,
+      };
+    }
+  }
+  return Object.create(drive, descriptors);
 }
 
 export const EXPORT_MAP = {
@@ -276,15 +306,28 @@ function createFolderResolver(folders, rootFolderId) {
   };
 }
 
+/** Page through one `files.list` query to exhaustion. */
+async function collectListPages(drive, listOpts, onItem) {
+  let pageToken = null;
+  do {
+    const response = await drive.files.list({ ...listOpts, pageToken });
+    for (const item of response.data.files || []) {
+      onItem(item);
+    }
+    pageToken = response.data.nextPageToken;
+  } while (pageToken);
+}
+
 /**
- * Single-pass fetch: get ALL non-trashed items (folders + files) in one
- * pagination loop, then split in memory. Cuts API round-trips in half.
+ * Fetch ALL non-trashed items. Drive page tokens are opaque, so a single
+ * listing can only be paged one request at a time; splitting folders from
+ * files gives two independent pagination loops that run at once, roughly
+ * halving wall time on a large drive.
  */
 async function fetchAllItems(drive, { fields, includeSharedDrives = false } = {}) {
   const allFields = fields || DEFAULT_ITEM_FIELDS;
   const folders = new Map();
   const files = [];
-  let pageToken = null;
 
   // Fetch the real My Drive root folder metadata in parallel with
   // the main list.  Google Drive API returns actual folder IDs in
@@ -295,31 +338,31 @@ async function fetchAllItems(drive, { fields, includeSharedDrives = false } = {}
     .get({ fileId: "root", fields: "id,name,mimeType,parents,createdTime" })
     .catch(() => null);
 
+  const sharedDriveOpts = includeSharedDrives
+    ? {
+        includeItemsFromAllDrives: true,
+        supportsAllDrives: true,
+        corpora: "allDrives",
+      }
+    : {};
   const listOpts = {
-    q: "trashed = false",
     fields: allFields,
     pageSize: PAGE_SIZE,
+    ...sharedDriveOpts,
   };
-  if (includeSharedDrives) {
-    listOpts.includeItemsFromAllDrives = true;
-    listOpts.supportsAllDrives = true;
-    listOpts.corpora = "allDrives";
-  }
 
-  do {
-    listOpts.pageToken = pageToken;
-    const response = await drive.files.list(listOpts);
-
-    for (const item of response.data.files || []) {
-      if (item.mimeType === FOLDER_MIME) {
-        folders.set(item.id, item);
-      } else {
-        files.push(item);
-      }
-    }
-
-    pageToken = response.data.nextPageToken;
-  } while (pageToken);
+  await Promise.all([
+    collectListPages(
+      drive,
+      { ...listOpts, q: `trashed = false and mimeType = '${FOLDER_MIME}'` },
+      (item) => folders.set(item.id, item)
+    ),
+    collectListPages(
+      drive,
+      { ...listOpts, q: `trashed = false and mimeType != '${FOLDER_MIME}'` },
+      (item) => files.push(item)
+    ),
+  ]);
 
   // Add the real root folder so the orphan checker can walk up to it.
   const rootRes = await rootPromise;
@@ -564,11 +607,6 @@ function itemParentId(item) {
   return item?.parents?.[0] || "";
 }
 
-function itemIsInsideMemoTree(item, trackedFolderIds, rootFolderId) {
-  const parentId = itemParentId(item);
-  return parentId === rootFolderId || trackedFolderIds.has(parentId);
-}
-
 function applyChangedItemsToMemo(memo, changes, rootFolderId) {
   const items = new Map();
   for (const folder of memo.folders || []) {
@@ -578,44 +616,67 @@ function applyChangedItemsToMemo(memo, changes, rootFolderId) {
     if (file?.id) items.set(file.id, file);
   }
 
+  // The feed is chronological and one file can appear several times in a
+  // single window, so collapse to each file's final state first. Replaying
+  // every entry instead would let an earlier edit overwrite a later one, and
+  // would resurrect a file that was edited and then trashed.
+  const latestChanges = new Map();
   for (const change of changes) {
-    if (change.removed || change.file?.trashed) {
-      items.delete(change.fileId);
+    const fileId = change.fileId || change.file?.id;
+    if (fileId) latestChanges.set(fileId, change);
+  }
+
+  const pending = new Map();
+  for (const [fileId, change] of latestChanges) {
+    if (change.removed || change.file?.trashed || !change.file?.id) {
+      items.delete(fileId);
+    } else if (!isRemoteMemoItem(change.file)) {
+      pending.set(fileId, change.file);
     }
   }
 
-  const pending = changes
-    .filter((change) =>
-      !change.removed &&
-      !change.file?.trashed &&
-      change.file?.id &&
-      !isRemoteMemoItem(change.file)
-    )
-    .map((change) => change.file);
-
-  let changed = true;
-  while (changed && pending.length > 0) {
-    changed = false;
-    const trackedFolderIds = new Set(
-      [...items.values()]
-        .filter((item) => item.mimeType === FOLDER_MIME)
-        .map((item) => item.id)
-    );
-    trackedFolderIds.add(rootFolderId);
-
-    for (let index = pending.length - 1; index >= 0; index--) {
-      const item = pending[index];
-      const wasTracked = items.has(item.id);
-      const isRoot = item.id === rootFolderId;
-      const isInside = isRoot || itemIsInsideMemoTree(item, trackedFolderIds, rootFolderId);
-
-      if (wasTracked || isInside) {
-        items.set(item.id, item);
-        pending.splice(index, 1);
-        changed = true;
-      }
+  // Index newcomers by parent so the tree is walked once. Rescanning every
+  // memo item to rebuild the tracked-folder set once per level of nesting
+  // costs O(changes x memo size), which is exactly the case this delta path
+  // exists to serve — memos only kick in past 5000 files.
+  const pendingByParent = new Map();
+  for (const item of pending.values()) {
+    const parentId = itemParentId(item);
+    let siblings = pendingByParent.get(parentId);
+    if (!siblings) {
+      siblings = [];
+      pendingByParent.set(parentId, siblings);
     }
+    siblings.push(item);
   }
+
+  // Work queue of folders already known to sit inside the memo tree; accepting
+  // a folder extends the frontier to its children.
+  const reachableFolderIds = [rootFolderId];
+  for (const item of items.values()) {
+    if (item.mimeType === FOLDER_MIME) reachableFolderIds.push(item.id);
+  }
+
+  function accept(item) {
+    if (!pending.delete(item.id)) return;
+    items.set(item.id, item);
+    if (item.mimeType === FOLDER_MIME) reachableFolderIds.push(item.id);
+  }
+
+  // An update to something the memo already tracks stays tracked, wherever it
+  // moved to.
+  for (const item of [...pending.values()]) {
+    if (items.has(item.id) || item.id === rootFolderId) accept(item);
+  }
+
+  for (let index = 0; index < reachableFolderIds.length; index++) {
+    const children = pendingByParent.get(reachableFolderIds[index]);
+    if (!children) continue;
+    for (const child of children) accept(child);
+  }
+
+  // Whatever is still pending never connected to the memo tree — it lives
+  // outside the configured root and stays excluded.
 
   const folders = new Map();
   const files = [];
@@ -1083,38 +1144,49 @@ export function assertNoDuplicateFolders(duplicateFolders) {
   }
 }
 
-export async function downloadFile(drive, fileMeta, localPath) {
-  fs.mkdirSync(path.dirname(localPath), { recursive: true });
+// A stream that dies mid-body never reaches withDriveRetry — that already
+// resolved when the response headers arrived — so downloads retry themselves.
+const DOWNLOAD_MAX_ATTEMPTS = 3;
+const RETRYABLE_STREAM_CODES = new Set([
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "ECONNABORTED",
+  "EPIPE",
+  "ERR_STREAM_PREMATURE_CLOSE",
+  "EAI_AGAIN",
+]);
 
-  const mime = fileMeta.mimeType || "";
-  const exportInfo = EXPORT_MAP[mime];
+function isRetryableStreamError(err) {
+  // Numeric codes and HTTP responses are statuses, which withDriveRetry
+  // already handled on the way in; retrying them here would multiply attempts.
+  if (err?.response?.status || typeof err?.code === "number") return false;
+  if (RETRYABLE_STREAM_CODES.has(err?.code)) return true;
+  return /socket hang up|premature close|aborted/i.test(err?.message || "");
+}
 
-  if (exportInfo) {
-    let targetPath = localPath;
-    if (!targetPath.endsWith(exportInfo.ext)) {
-      const parsed = path.parse(targetPath);
-      targetPath = path.join(parsed.dir, parsed.name + exportInfo.ext);
+async function withStreamRetry(fn) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const retryable = err?.aethelIntegrityFailure || isRetryableStreamError(err);
+      if (!retryable || attempt >= DOWNLOAD_MAX_ATTEMPTS - 1) throw err;
+      await new Promise((r) => setTimeout(r, getRetryDelay(err, attempt)));
     }
-
-    const response = await drive.files.export(
-      { fileId: fileMeta.id, mimeType: exportInfo.mime, supportsAllDrives: true },
-      { responseType: "stream" }
-    );
-    await pipeline(response.data, fs.createWriteStream(targetPath));
-    // Exported files have no md5Checksum from Drive — skip verification
-    return;
   }
+}
 
-  if (isWorkspaceType(mime)) {
-    throw new Error(
-      `Cannot download Google Workspace file '${fileMeta.name || fileMeta.id}' ` +
-        `with unsupported mimeType '${mime}'`
-    );
-  }
+async function exportToPath(drive, fileMeta, exportInfo, targetPath) {
+  const response = await drive.files.export(
+    { fileId: fileMeta.id, mimeType: exportInfo.mime, supportsAllDrives: true },
+    { responseType: "stream" }
+  );
+  await pipeline(response.data, fs.createWriteStream(targetPath));
+}
 
+async function downloadMediaToPath(drive, fileMeta, localPath) {
   // Stream to disk while computing MD5 in parallel
-  const { createHash } = await import("node:crypto");
-  const md5 = createHash("md5");
+  const md5 = crypto.createHash("md5");
   const writeStream = fs.createWriteStream(localPath);
   const response = await drive.files.get(
     { fileId: fileMeta.id, alt: "media", supportsAllDrives: true },
@@ -1130,13 +1202,56 @@ export async function downloadFile(drive, fileMeta, localPath) {
   if (expectedMd5) {
     const actualMd5 = md5.digest("hex");
     if (actualMd5 !== expectedMd5) {
-      // Remove corrupt file
-      fs.unlinkSync(localPath);
-      throw new Error(
+      const err = new Error(
         `Integrity check failed for ${fileMeta.name}: ` +
-        `expected md5 ${expectedMd5}, got ${actualMd5}`
+          `expected md5 ${expectedMd5}, got ${actualMd5}`
       );
+      err.aethelIntegrityFailure = true;
+      throw err;
     }
+  }
+}
+
+export async function downloadFile(drive, fileMeta, localPath) {
+  fs.mkdirSync(path.dirname(localPath), { recursive: true });
+
+  const mime = fileMeta.mimeType || "";
+  const exportInfo = EXPORT_MAP[mime];
+
+  if (exportInfo) {
+    let targetPath = localPath;
+    if (!targetPath.endsWith(exportInfo.ext)) {
+      const parsed = path.parse(targetPath);
+      targetPath = path.join(parsed.dir, parsed.name + exportInfo.ext);
+    }
+
+    // Exported files have no md5Checksum from Drive — skip verification
+    await withStreamRetry(() =>
+      exportToPath(drive, fileMeta, exportInfo, targetPath)
+    );
+    return;
+  }
+
+  if (isWorkspaceType(mime)) {
+    throw new Error(
+      `Cannot download Google Workspace file '${fileMeta.name || fileMeta.id}' ` +
+        `with unsupported mimeType '${mime}'`
+    );
+  }
+
+  try {
+    // Each attempt reopens the write stream, which truncates — a retry always
+    // restarts from byte zero rather than appending to a partial file.
+    await withStreamRetry(() => downloadMediaToPath(drive, fileMeta, localPath));
+  } catch (err) {
+    // The write stream truncated the file on open, so whatever is on disk is
+    // already unusable — leave nothing behind for the next scan to pick up.
+    try {
+      fs.unlinkSync(localPath);
+    } catch {
+      // Nothing was written, or it is already gone.
+    }
+    throw err;
   }
 }
 
@@ -1152,18 +1267,54 @@ export async function uploadFile(
   } = {}
 ) {
   const name = path.basename(remotePath);
-  const makeMedia = () => ({ body: fs.createReadStream(localPath) });
   const targetParentId = parentId || "root";
+
+  // Hash the bytes on their way out. Verifying the upload afterwards otherwise
+  // means reading the whole file a second time, which doubles the disk cost of
+  // every large upload — and hashing what was actually sent is a stronger
+  // check than re-reading a file that may have changed since.
+  //
+  // A Transform rather than a `data` listener on the read stream: a listener
+  // would switch the source to flowing mode immediately, and googleapis does
+  // async work before it pipes the body, so bytes emitted in between would
+  // never reach Drive.
+  let streamedMd5 = null;
+  const makeMedia = () => {
+    const hash = crypto.createHash("md5");
+    const source = fs.createReadStream(localPath);
+    const hashingBody = new Transform({
+      transform(chunk, _encoding, callback) {
+        hash.update(chunk);
+        callback(null, chunk);
+      },
+      flush(callback) {
+        streamedMd5 = hash.digest("hex");
+        callback();
+      },
+    });
+    // Keep ENOENT and friends visible to the caller, which treats a missing
+    // source as a local deletion rather than an error.
+    source.on("error", (err) => hashingBody.destroy(err));
+    source.pipe(hashingBody);
+    return { body: hashingBody };
+  };
+
+  // Only meaningful once the body has been fully sent, which is true by the
+  // time any of these requests resolve.
+  const withStreamedMd5 = (data) =>
+    streamedMd5 ? { ...data, aethelStreamMd5: streamedMd5 } : data;
 
   if (existingId) {
     try {
-      const response = await drive.files.update({
-        fileId: existingId,
-        requestBody: { name },
-        media: makeMedia(),
-        supportsAllDrives: true,
-        fields: "id,name,parents,md5Checksum,modifiedTime,size,mimeType",
-      });
+      const response = await withRetry(() =>
+        drive.files.update({
+          fileId: existingId,
+          requestBody: { name },
+          media: makeMedia(),
+          supportsAllDrives: true,
+          fields: "id,name,parents,md5Checksum,modifiedTime,size,mimeType",
+        })
+      );
       if (cleanupDuplicates) {
         await trashDuplicateUploadTargets(
           drive,
@@ -1173,7 +1324,7 @@ export async function uploadFile(
           childIndexCache
         );
       }
-      return response.data;
+      return withStreamedMd5(response.data);
     } catch (err) {
       if (!isMissingDriveFileError(err)) {
         throw err;
@@ -1189,15 +1340,17 @@ export async function uploadFile(
       childIndexCache
     );
     if (existing) {
-      const response = await drive.files.update({
-        fileId: existing.id,
-        requestBody: { name },
-        media: makeMedia(),
-        supportsAllDrives: true,
-        fields: "id,name,parents,md5Checksum,modifiedTime,size,mimeType",
-      });
+      const response = await withRetry(() =>
+        drive.files.update({
+          fileId: existing.id,
+          requestBody: { name },
+          media: makeMedia(),
+          supportsAllDrives: true,
+          fields: "id,name,parents,md5Checksum,modifiedTime,size,mimeType",
+        })
+      );
       await trashDuplicateUploadTargets(drive, targetParentId, name, response.data.id);
-      return response.data;
+      return withStreamedMd5(response.data);
     }
   }
 
@@ -1206,12 +1359,14 @@ export async function uploadFile(
     requestBody.parents = [targetParentId];
   }
 
-  const response = await drive.files.create({
-    requestBody,
-    media: makeMedia(),
-    supportsAllDrives: true,
-    fields: "id,name,parents,md5Checksum,modifiedTime,size,mimeType",
-  });
+  const response = await withRetry(() =>
+    drive.files.create({
+      requestBody,
+      media: makeMedia(),
+      supportsAllDrives: true,
+      fields: "id,name,parents,md5Checksum,modifiedTime,size,mimeType",
+    })
+  );
   if (cleanupDuplicates) {
     await trashDuplicateUploadTargets(
       drive,
@@ -1221,7 +1376,7 @@ export async function uploadFile(
       childIndexCache
     );
   }
-  return response.data;
+  return withStreamedMd5(response.data);
 }
 
 function isMissingDriveFileError(err) {
@@ -1546,40 +1701,30 @@ export async function batchOperateFiles(
   let errors = 0;
   const total = files.length;
 
-  for (let start = 0; start < total; start += CLEANER_BATCH_SIZE) {
-    const chunk = files.slice(start, start + CLEANER_BATCH_SIZE);
-    const results = await Promise.allSettled(
-      chunk.map(async (file) => {
-        if (permanent) {
-          await drive.files.delete({
-            fileId: file.id,
-            supportsAllDrives: includeSharedDrives,
-          });
-          return { verb: "Deleted", name: file.name };
-        }
-
+  // A continuously refilled pool rather than fixed chunks: waiting for the
+  // slowest request in each group of 20 before issuing the next 20 leaves most
+  // slots idle whenever one file is slow to trash.
+  await mapWithConcurrency(files, CLEANER_BATCH_SIZE, async (file) => {
+    try {
+      if (permanent) {
+        await drive.files.delete({
+          fileId: file.id,
+          supportsAllDrives: includeSharedDrives,
+        });
+      } else {
         await drive.files.update({
           fileId: file.id,
           requestBody: { trashed: true },
           supportsAllDrives: includeSharedDrives,
         });
-        return { verb: "Trashed", name: file.name };
-      })
-    );
-
-    for (const [index, result] of results.entries()) {
-      const file = chunk[index];
-
-      if (result.status === "fulfilled") {
-        success += 1;
-        onProgress?.(success + errors, total, result.value.verb, file.name);
-        continue;
       }
-
+      success += 1;
+      onProgress?.(success + errors, total, permanent ? "Deleted" : "Trashed", file.name);
+    } catch {
       errors += 1;
       onProgress?.(success + errors, total, "FAILED", file.name);
     }
-  }
+  });
 
   return { success, errors };
 }
@@ -1677,6 +1822,62 @@ function shouldIgnoreUploadPath(targetPath, isDirectory, context) {
   }
 
   return context.ignoreRules.ignores(relativePath);
+}
+
+/**
+ * Run a self-extending queue of tasks under a fixed concurrency ceiling.
+ * `runTask` gets a `push` callback for follow-up work, which the next free
+ * slot picks up immediately — no barrier between one generation and the next.
+ * FIFO over an index cursor, so traversal stays breadth-first.
+ */
+async function runTaskPump(initialTasks, limit, runTask) {
+  const queue = [...initialTasks];
+  let queueCursor = 0;
+  let active = 0;
+  let settled = false;
+
+  await new Promise((resolve, reject) => {
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+
+    const push = (task) => {
+      queue.push(task);
+    };
+
+    const pump = () => {
+      if (settled) return;
+
+      if (queueCursor >= queue.length && active === 0) {
+        settled = true;
+        resolve();
+        return;
+      }
+
+      while (active < limit && queueCursor < queue.length) {
+        const task = queue[queueCursor];
+        queueCursor += 1;
+        active += 1;
+
+        Promise.resolve()
+          .then(() => runTask(task, push))
+          .then(
+            () => {
+              active -= 1;
+              pump();
+            },
+            (err) => {
+              active -= 1;
+              fail(err);
+            }
+          );
+      }
+    };
+
+    pump();
+  });
 }
 
 async function mapWithConcurrency(items, limit, worker) {
@@ -2147,6 +2348,86 @@ async function uploadLocalFileToParent(
   return { uploadedFiles: 1, uploadedDirectories: 0 };
 }
 
+/**
+ * Walk a local tree into Drive with one continuously refilled pool.
+ *
+ * Recursing with a pool per directory imposed two costs: a directory's own
+ * files waited for every one of its subtrees to finish first, and each level
+ * of nesting opened another UPLOAD_BATCH_SIZE-wide pool, so the real ceiling
+ * multiplied with depth instead of holding at the limit. One shared queue
+ * keeps exactly UPLOAD_BATCH_SIZE requests in flight across the whole tree,
+ * and any file becomes eligible the moment its own directory has been listed.
+ *
+ * A directory task uploads the *contents* of `localPath` into `parentId`,
+ * first creating a Drive folder for `localPath` itself when `createFolder`.
+ */
+async function uploadTreeToParent(drive, initialTasks, onProgress, context) {
+  let uploadedFiles = 0;
+  let uploadedDirectories = 0;
+
+  await runTaskPump(initialTasks, UPLOAD_BATCH_SIZE, async (task, push) => {
+    if (task.kind === "file") {
+      const result = await uploadLocalFileToParent(
+        drive,
+        task.localPath,
+        task.parentId,
+        onProgress,
+        context
+      );
+      uploadedFiles += result.uploadedFiles;
+      return;
+    }
+
+    await assertParentWritable(drive, task.parentId, context.parentMetaCache);
+
+    let targetId = task.parentId;
+    if (task.createFolder) {
+      const directoryName = path.basename(task.localPath);
+      let targetFolder = await resolveCanonicalFolder(
+        drive,
+        task.parentId,
+        directoryName,
+        false,
+        { childIndexCache: context.childIndexCache }
+      );
+
+      if (!targetFolder) {
+        onProgress?.("mkdir", task.localPath, directoryName);
+        targetFolder = await resolveCanonicalFolder(
+          drive,
+          task.parentId,
+          directoryName,
+          true,
+          { childIndexCache: context.childIndexCache }
+        );
+      }
+
+      targetId = targetFolder.id;
+      uploadedDirectories += 1;
+    }
+
+    const entries = await fs.promises.readdir(task.localPath, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) continue;
+      const childPath = path.join(task.localPath, entry.name);
+      if (shouldIgnoreUploadPath(childPath, entry.isDirectory(), context)) continue;
+
+      if (entry.isFile()) {
+        push({ kind: "file", localPath: childPath, parentId: targetId });
+      } else if (entry.isDirectory()) {
+        push({
+          kind: "dir",
+          localPath: childPath,
+          parentId: targetId,
+          createFolder: true,
+        });
+      }
+    }
+  });
+
+  return { uploadedFiles, uploadedDirectories };
+}
+
 async function uploadLocalDirectoryToParent(
   drive,
   localPath,
@@ -2154,81 +2435,12 @@ async function uploadLocalDirectoryToParent(
   onProgress = null,
   context = createUploadContext(localPath)
 ) {
-  const directoryName = path.basename(localPath);
-  await assertParentWritable(drive, parentId, context.parentMetaCache);
-  const existingFolder = await resolveCanonicalFolder(
+  return uploadTreeToParent(
     drive,
-    parentId,
-    directoryName,
-    false,
-    { childIndexCache: context.childIndexCache }
+    [{ kind: "dir", localPath, parentId, createFolder: true }],
+    onProgress,
+    context
   );
-  let targetFolder = existingFolder;
-
-  if (!targetFolder) {
-    onProgress?.("mkdir", localPath, directoryName);
-    targetFolder = await resolveCanonicalFolder(
-      drive,
-      parentId,
-      directoryName,
-      true,
-      { childIndexCache: context.childIndexCache }
-    );
-  }
-
-  const entries = (await fs.promises.readdir(localPath, { withFileTypes: true })).filter(
-    (entry) => {
-      if (entry.name.startsWith(".")) {
-        return false;
-      }
-      return !shouldIgnoreUploadPath(
-        path.join(localPath, entry.name),
-        entry.isDirectory(),
-        context
-      );
-    }
-  );
-  let uploadedFiles = 0;
-  let uploadedDirectories = 1;
-
-  const directories = entries.filter((entry) => entry.isDirectory());
-  const files = entries.filter((entry) => entry.isFile());
-  const directoryResults = await mapWithConcurrency(
-    directories,
-    UPLOAD_BATCH_SIZE,
-    async (entry) =>
-      uploadLocalDirectoryToParent(
-        drive,
-        path.join(localPath, entry.name),
-        targetFolder.id,
-        onProgress,
-        context
-      )
-  );
-
-  for (const nestedResult of directoryResults) {
-    uploadedFiles += nestedResult.uploadedFiles;
-    uploadedDirectories += nestedResult.uploadedDirectories;
-  }
-
-  const fileResults = await mapWithConcurrency(
-    files,
-    UPLOAD_BATCH_SIZE,
-    async (entry) =>
-      uploadLocalFileToParent(
-        drive,
-        path.join(localPath, entry.name),
-        targetFolder.id,
-        onProgress,
-        context
-      )
-  );
-
-  for (const fileResult of fileResults) {
-    uploadedFiles += fileResult.uploadedFiles;
-  }
-
-  return { uploadedFiles, uploadedDirectories };
 }
 
 async function syncLocalDirectoryContentsToParent(
@@ -2238,87 +2450,19 @@ async function syncLocalDirectoryContentsToParent(
   onProgress = null,
   context = createUploadContext(localPath)
 ) {
-  const resolvedPath = path.resolve(localPath);
-  await assertParentWritable(drive, parentId, context.parentMetaCache);
-  const entries = (await fs.promises.readdir(resolvedPath, { withFileTypes: true })).filter(
-    (entry) => {
-      if (entry.name.startsWith(".")) {
-        return false;
-      }
-      return !shouldIgnoreUploadPath(
-        path.join(resolvedPath, entry.name),
-        entry.isDirectory(),
-        context
-      );
-    }
-  );
-  let uploadedFiles = 0;
-  let uploadedDirectories = 0;
-
-  const directories = entries.filter((entry) => entry.isDirectory());
-  const files = entries.filter((entry) => entry.isFile());
-  const directoryResults = await mapWithConcurrency(
-    directories,
-    UPLOAD_BATCH_SIZE,
-    async (entry) => {
-      const childPath = path.join(resolvedPath, entry.name);
-      let targetFolder = await resolveCanonicalFolder(
-        drive,
+  return uploadTreeToParent(
+    drive,
+    [
+      {
+        kind: "dir",
+        localPath: path.resolve(localPath),
         parentId,
-        entry.name,
-        false,
-        { childIndexCache: context.childIndexCache }
-      );
-
-      if (!targetFolder) {
-        onProgress?.("mkdir", childPath, entry.name);
-        targetFolder = await resolveCanonicalFolder(
-          drive,
-          parentId,
-          entry.name,
-          true,
-          { childIndexCache: context.childIndexCache }
-        );
-      }
-
-      const nestedResult = await syncLocalDirectoryContentsToParent(
-        drive,
-        childPath,
-        targetFolder.id,
-        onProgress,
-        context
-      );
-
-      return {
-        uploadedFiles: nestedResult.uploadedFiles,
-        uploadedDirectories: nestedResult.uploadedDirectories + 1,
-      };
-    }
+        createFolder: false,
+      },
+    ],
+    onProgress,
+    context
   );
-
-  for (const nestedResult of directoryResults) {
-    uploadedFiles += nestedResult.uploadedFiles;
-    uploadedDirectories += nestedResult.uploadedDirectories;
-  }
-
-  const fileResults = await mapWithConcurrency(
-    files,
-    UPLOAD_BATCH_SIZE,
-    async (entry) =>
-      uploadLocalFileToParent(
-        drive,
-        path.join(resolvedPath, entry.name),
-        parentId,
-        onProgress,
-        context
-      )
-  );
-
-  for (const fileResult of fileResults) {
-    uploadedFiles += fileResult.uploadedFiles;
-  }
-
-  return { uploadedFiles, uploadedDirectories };
 }
 
 export async function uploadLocalEntry(

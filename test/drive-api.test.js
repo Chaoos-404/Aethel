@@ -19,6 +19,7 @@ import {
   downloadFile,
   uploadFile,
   uploadLocalEntry,
+  withDriveRetry,
 } from "../src/core/drive-api.js";
 import { executeStaged } from "../src/core/sync.js";
 
@@ -113,6 +114,11 @@ function createFakeDrive(initialItems = [], { listDelayMs = 0 } = {}) {
       const mimeMatch = part.match(/^mimeType = '(.+)'$/);
       if (mimeMatch) {
         return item.mimeType === decodeQueryValue(mimeMatch[1]);
+      }
+
+      const mimeExclusionMatch = part.match(/^mimeType != '(.+)'$/);
+      if (mimeExclusionMatch) {
+        return item.mimeType !== decodeQueryValue(mimeExclusionMatch[1]);
       }
 
       const parentMatch = part.match(/^'(.+)' in parents$/);
@@ -298,6 +304,22 @@ function createFakeDrive(initialItems = [], { listDelayMs = 0 } = {}) {
   };
 }
 
+/**
+ * True when the drive was asked for a whole-drive listing. The global fetch
+ * pages folders and files as two concurrent queries, so match on the shape
+ * rather than one exact string.
+ */
+function performedGlobalListing(drive) {
+  return drive.listQueries().some((query) => query.startsWith("trashed = false"));
+}
+
+/** How many whole-drive listings ran (one folder query per listing). */
+function globalListingCount(drive) {
+  return drive
+    .listQueries()
+    .filter((query) => query === `trashed = false and mimeType = '${FOLDER_MIME}'`).length;
+}
+
 function buildNestedDuplicateItems() {
   return [
     folder("top-a", "其他", "root", "2026-04-04T10:32:21.468Z"),
@@ -394,10 +416,7 @@ test("dedupeDuplicateFolders merges nested folders and trashes empty losers", as
   assert.equal(liveFiles.some((item) => item.name === "root-only.txt" && item.parents[0] === "top-a"), true);
   assert.equal(liveFiles.some((item) => item.name === "move.txt" && item.parents[0] === "docs-a"), true);
   assert.equal(snapshot.find((item) => item.id === "same-b").trashed, true);
-  assert.equal(
-    drive.listQueries().filter((query) => query === "trashed = false").length,
-    2
-  );
+  assert.equal(globalListingCount(drive), 2);
 });
 
 test("dedupeDuplicateFolders leaves conflicting duplicates in place", async () => {
@@ -481,7 +500,7 @@ test("getRemoteState walks only the configured Drive folder tree", async () => {
     ["docs/inside.txt", "empty", "root-child.txt"]
   );
   assert.equal(
-    drive.listQueries().some((query) => query === "trashed = false"),
+    performedGlobalListing(drive),
     false
   );
   assert.deepEqual(drive.listQueries().filter((query) => query.includes(" in parents ")), [
@@ -506,8 +525,52 @@ test("getRemoteState uses global fetch for large configured folder snapshots", a
 
   assert.deepEqual(remoteState.files.map((item) => item.path), ["docs/inside.txt"]);
   assert.equal(
-    drive.listQueries().some((query) => query === "trashed = false"),
+    performedGlobalListing(drive),
     true
+  );
+  // Folders and files page concurrently as two independent listings.
+  assert.deepEqual(
+    drive.listQueries().filter((query) => query.startsWith("trashed = false")).sort(),
+    [
+      `trashed = false and mimeType != '${FOLDER_MIME}'`,
+      `trashed = false and mimeType = '${FOLDER_MIME}'`,
+    ].sort()
+  );
+});
+
+test("global fetch pages folders and files concurrently", async () => {
+  const items = [folder("project", "Project", "real-my-drive-root", "2026-04-04T10:00:00.000Z")];
+  // Enough of each kind to force several pages per listing.
+  for (let i = 0; i < 5; i++) {
+    items.push(folder(`sub-${i}`, `sub-${i}`, "project", `2026-04-04T10:0${i}:00.000Z`));
+    items.push(file(`file-${i}`, `file-${i}.txt`, "project", `2026-04-04T10:1${i}:00.000Z`, `md5-${i}`));
+  }
+
+  const drive = createFakeDrive(items, { listDelayMs: 20 });
+  const originalList = drive.files.list.bind(drive.files);
+  let inFlight = 0;
+  let peakInFlight = 0;
+  drive.files.list = async (params) => {
+    inFlight += 1;
+    peakInFlight = Math.max(peakInFlight, inFlight);
+    try {
+      return await originalList({ ...params, pageSize: 2 });
+    } finally {
+      inFlight -= 1;
+    }
+  };
+
+  const remoteState = await getRemoteState(drive, "project", null, {
+    estimatedRemoteFiles: 50_000,
+  });
+
+  assert.equal(peakInFlight, 2, "folder and file listings should overlap");
+  assert.deepEqual(
+    remoteState.files.map((item) => item.path).sort(),
+    [
+      "file-0.txt", "file-1.txt", "file-2.txt", "file-3.txt", "file-4.txt",
+      "sub-0", "sub-1", "sub-2", "sub-3", "sub-4",
+    ]
   );
 });
 
@@ -523,7 +586,7 @@ test("getRemoteState reuses Drive memo and applies incremental changes", async (
   const firstState = await getRemoteState(drive, "project", null, options);
   assert.deepEqual(firstState.files.map((item) => item.path), ["inside.txt"]);
   assert.equal(
-    drive.listQueries().some((query) => query === "trashed = false"),
+    performedGlobalListing(drive),
     true
   );
 
@@ -543,8 +606,90 @@ test("getRemoteState reuses Drive memo and applies incremental changes", async (
     ["inside.txt", "new.txt"]
   );
   assert.equal(
-    drive.listQueries().some((query) => query === "trashed = false"),
+    performedGlobalListing(drive),
     false
+  );
+});
+
+test("getRemoteState memo keeps the newest of several edits to one file", async () => {
+  const drive = createFakeDrive([
+    folder("project", "Project", "real-my-drive-root", "2026-04-04T10:00:00.000Z"),
+    file("inside", "inside.txt", "project", "2026-04-04T10:02:00.000Z", "inside"),
+  ]);
+  const options = { estimatedRemoteFiles: 50_000 };
+
+  await getRemoteState(drive, "project", null, options);
+
+  await drive.files.update({
+    fileId: "inside",
+    media: { body: Readable.from(["second"]) },
+  });
+  await drive.files.update({
+    fileId: "inside",
+    media: { body: Readable.from(["third"]) },
+  });
+
+  const state = await getRemoteState(drive, "project", null, options);
+
+  assert.equal(state.files.length, 1);
+  assert.equal(state.files[0].md5Checksum, md5(Buffer.from("third")));
+});
+
+test("getRemoteState memo drops a file edited and then trashed in one window", async () => {
+  const drive = createFakeDrive([
+    folder("project", "Project", "real-my-drive-root", "2026-04-04T10:00:00.000Z"),
+    file("inside", "inside.txt", "project", "2026-04-04T10:02:00.000Z", "inside"),
+    file("keep", "keep.txt", "project", "2026-04-04T10:03:00.000Z", "keep"),
+  ]);
+  const options = { estimatedRemoteFiles: 50_000 };
+
+  await getRemoteState(drive, "project", null, options);
+
+  await drive.files.update({
+    fileId: "inside",
+    media: { body: Readable.from(["edited"]) },
+  });
+  await drive.files.update({
+    fileId: "inside",
+    requestBody: { trashed: true },
+  });
+
+  const state = await getRemoteState(drive, "project", null, options);
+
+  assert.deepEqual(state.files.map((item) => item.path), ["keep.txt"]);
+});
+
+test("getRemoteState memo tracks a new folder chain reported deepest-first", async () => {
+  const drive = createFakeDrive([
+    folder("project", "Project", "real-my-drive-root", "2026-04-04T10:00:00.000Z"),
+    file("inside", "inside.txt", "project", "2026-04-04T10:02:00.000Z", "inside"),
+  ]);
+  const options = { estimatedRemoteFiles: 50_000 };
+
+  await getRemoteState(drive, "project", null, options);
+
+  // Build the chain leaf-first so the change feed reports children before the
+  // parents they hang from.
+  const leafFile = { id: "chain-file", name: "deep.txt", parents: ["chain-c"] };
+  const chain = [
+    folder("chain-c", "c", "chain-b", "2026-04-04T11:00:00.000Z"),
+    folder("chain-b", "b", "chain-a", "2026-04-04T11:00:01.000Z"),
+    folder("chain-a", "a", "project", "2026-04-04T11:00:02.000Z"),
+  ];
+
+  const memoChanges = [
+    { fileId: leafFile.id, file: { ...leafFile, mimeType: "text/plain", md5Checksum: "deep" } },
+    ...chain.map((item) => ({ fileId: item.id, file: item })),
+  ];
+  drive.changes.list = async () => ({
+    data: { changes: memoChanges.map(clone), newStartPageToken: "999" },
+  });
+
+  const state = await getRemoteState(drive, "project", null, options);
+
+  assert.deepEqual(
+    state.files.map((item) => item.path).sort(),
+    ["a/b/c/deep.txt", "inside.txt"]
   );
 });
 
@@ -571,7 +716,7 @@ test("getRemoteState can refresh Drive memo from an authoritative listing", asyn
 
   assert.deepEqual(refreshedState.files, []);
   assert.equal(
-    drive.listQueries().some((query) => query === "trashed = false"),
+    performedGlobalListing(drive),
     true
   );
   assert.equal(
@@ -681,6 +826,71 @@ test("executeStaged downloads staged files without an extra metadata request", a
     assert.equal(metadataGets, 0);
     assert.equal(mediaGets, 1);
     assert.equal(await fs.readFile(path.join(workspaceRoot, "fast.txt"), "utf8"), "downloaded content");
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("executeStaged starts the largest staged transfer first", async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-schedule-"));
+
+  try {
+    initWorkspace(workspaceRoot, null, "My Drive");
+    const bodies = new Map([
+      ["remote-small-1", Buffer.from("a")],
+      ["remote-small-2", Buffer.from("b")],
+      ["remote-huge", Buffer.from("c".repeat(4096))],
+    ]);
+
+    // The big file is staged last, where a FIFO pool would leave it running
+    // alone after everything else drained.
+    writeIndex(workspaceRoot, {
+      staged: [
+        {
+          action: "download",
+          path: "small-1.txt",
+          localPath: "small-1.txt",
+          fileId: "remote-small-1",
+          remoteMimeType: "text/plain",
+          remoteMd5Checksum: md5(bodies.get("remote-small-1")),
+          remoteSize: 1,
+        },
+        {
+          action: "download",
+          path: "small-2.txt",
+          localPath: "small-2.txt",
+          fileId: "remote-small-2",
+          remoteMimeType: "text/plain",
+          remoteMd5Checksum: md5(bodies.get("remote-small-2")),
+          remoteSize: 1,
+        },
+        {
+          action: "download",
+          path: "huge.bin",
+          localPath: "huge.bin",
+          fileId: "remote-huge",
+          remoteMimeType: "text/plain",
+          remoteMd5Checksum: md5(bodies.get("remote-huge")),
+          remoteSize: 4096,
+        },
+      ],
+    });
+
+    const started = [];
+    const result = await executeStaged(
+      {
+        files: {
+          async get(params) {
+            started.push(params.fileId);
+            return { data: Readable.from([bodies.get(params.fileId)]) };
+          },
+        },
+      },
+      workspaceRoot
+    );
+
+    assert.equal(result.downloaded, 3);
+    assert.equal(started[0], "remote-huge");
   } finally {
     await fs.rm(workspaceRoot, { recursive: true, force: true });
   }
@@ -1073,6 +1283,157 @@ test("downloadFile rejects unsupported Google Workspace files before media downl
   }
 });
 
+test("downloadFile restarts a transfer that dies mid-stream", async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-download-"));
+
+  try {
+    const localPath = path.join(workspaceRoot, "report.md");
+    const contents = "the full body of the file";
+    let attempts = 0;
+
+    const drive = {
+      files: {
+        async get({ alt }) {
+          assert.equal(alt, "media");
+          attempts += 1;
+          if (attempts === 1) {
+            const stream = new Readable({ read() {} });
+            stream.push(contents.slice(0, 5));
+            setImmediate(() => {
+              stream.destroy(
+                Object.assign(new Error("socket hang up"), { code: "ECONNRESET" })
+              );
+            });
+            return { data: stream };
+          }
+          return { data: Readable.from([contents]) };
+        },
+      },
+    };
+
+    await downloadFile(
+      drive,
+      {
+        id: "remote-1",
+        name: "report.md",
+        mimeType: "text/markdown",
+        md5Checksum: md5(Buffer.from(contents)),
+      },
+      localPath
+    );
+
+    assert.equal(attempts, 2);
+    assert.equal(await fs.readFile(localPath, "utf8"), contents);
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("downloadFile leaves no file behind when integrity never checks out", async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-download-"));
+
+  try {
+    const localPath = path.join(workspaceRoot, "report.md");
+    let attempts = 0;
+
+    const drive = {
+      files: {
+        async get() {
+          attempts += 1;
+          return { data: Readable.from(["corrupted"]) };
+        },
+      },
+    };
+
+    await assert.rejects(
+      downloadFile(
+        drive,
+        {
+          id: "remote-1",
+          name: "report.md",
+          mimeType: "text/markdown",
+          md5Checksum: md5(Buffer.from("the real body")),
+        },
+        localPath
+      ),
+      /Integrity check failed for report\.md/
+    );
+
+    assert.equal(attempts, 3);
+    assert.equal(fsNative.existsSync(localPath), false);
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("withDriveRetry rebuilds the upload body on every attempt", async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-upload-"));
+
+  try {
+    const localPath = path.join(workspaceRoot, "report.md");
+    await fs.writeFile(localPath, "new content");
+
+    const fake = createFakeDrive([
+      file("remote-1", "report.md", "root", "2026-04-04T10:34:00.000Z", "old-1"),
+    ]);
+    const realUpdate = fake.files.update.bind(fake.files);
+    let updateCalls = 0;
+    fake.files.update = async (params) => {
+      updateCalls += 1;
+      if (updateCalls === 1) {
+        // Drive consumes the request body before answering, so a retry that
+        // reuses this stream has nothing left to send.
+        for await (const _chunk of params.media.body) {
+          // discard
+        }
+        const err = new Error("backend error");
+        err.code = 503;
+        throw err;
+      }
+      return realUpdate(params);
+    };
+
+    const drive = withDriveRetry(fake);
+    const result = await uploadFile(drive, localPath, "report.md", {
+      parentId: "root",
+      existingId: "remote-1",
+    });
+
+    assert.equal(updateCalls, 2);
+    // A retry that replayed the consumed stream would upload an empty body.
+    assert.equal(result.md5Checksum, md5(Buffer.from("new content")));
+    assert.equal(
+      fake.snapshot().find((item) => item.id === "remote-1")._body,
+      "new content"
+    );
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("withDriveRetry backs off on transient changes.list failures", async () => {
+  const fake = createFakeDrive([
+    file("remote-1", "report.md", "root", "2026-04-04T10:34:00.000Z", "md5-1"),
+  ]);
+  const realList = fake.changes.list.bind(fake.changes);
+  let listCalls = 0;
+  fake.changes.list = async (params) => {
+    listCalls += 1;
+    if (listCalls === 1) {
+      const err = new Error("rate limit exceeded");
+      err.code = 429;
+      throw err;
+    }
+    return realList(params);
+  };
+
+  const drive = withDriveRetry(fake);
+  const response = await drive.changes.list({ pageToken: "0" });
+
+  assert.equal(listCalls, 2);
+  assert.equal(response.data.changes.length, 0);
+});
+
 test("uploadFile updates an existing same-name file and trashes duplicates", async () => {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-upload-"));
 
@@ -1172,6 +1533,134 @@ test("uploadLocalEntry caches sibling lookups within the same target folder", as
       0
     );
   } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("uploadFile reports the md5 of the bytes it actually sent", async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-upload-"));
+
+  try {
+    const localPath = path.join(workspaceRoot, "report.md");
+    const contents = "x".repeat(200_000);
+    await fs.writeFile(localPath, contents);
+
+    const drive = createFakeDrive([]);
+    const result = await uploadFile(drive, localPath, "report.md", { parentId: "root" });
+
+    assert.equal(result.aethelStreamMd5, md5(Buffer.from(contents)));
+    assert.equal(result.md5Checksum, md5(Buffer.from(contents)));
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("executeStaged still fails a commit when Drive stores different bytes", async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-upload-"));
+
+  try {
+    initWorkspace(workspaceRoot, null, "My Drive");
+    await fs.writeFile(path.join(workspaceRoot, "report.md"), "local content");
+    writeIndex(workspaceRoot, {
+      staged: [{ action: "upload", path: "report.md", localPath: "report.md" }],
+    });
+
+    const drive = createFakeDrive([]);
+    const realCreate = drive.files.create.bind(drive.files);
+    drive.files.create = async (params) => {
+      const response = await realCreate(params);
+      return { data: { ...response.data, md5Checksum: "0".repeat(32) } };
+    };
+
+    const result = await executeStaged(drive, workspaceRoot);
+
+    assert.equal(result.uploaded, 0);
+    assert.equal(result.errors.length, 1);
+    assert.match(result.errors[0], /Upload integrity check failed for report\.md/);
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("bulk upload starts shallow files before deep subtrees finish", async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-tree-"));
+
+  try {
+    const deepDir = path.join(workspaceRoot, "deep", "a", "b", "c");
+    await fs.mkdir(deepDir, { recursive: true });
+    await fs.writeFile(path.join(deepDir, "deepest.txt"), "deep");
+    await fs.writeFile(path.join(workspaceRoot, "top-1.txt"), "one");
+    await fs.writeFile(path.join(workspaceRoot, "top-2.txt"), "two");
+
+    const drive = createFakeDrive([]);
+    const created = [];
+    const realCreate = drive.files.create.bind(drive.files);
+    drive.files.create = async (params) => {
+      created.push(params.requestBody.name);
+      return realCreate(params);
+    };
+
+    const result = await syncLocalDirectoryToParent(drive, workspaceRoot, "root");
+
+    assert.equal(result.uploadedFiles, 3);
+    assert.equal(result.uploadedDirectories, 4);
+    // Two phases per directory would have held both top-level files until the
+    // whole "deep" subtree was done.
+    assert.ok(
+      created.indexOf("top-1.txt") < created.indexOf("deepest.txt"),
+      `expected shallow files to start first, got ${created.join(", ")}`
+    );
+    assert.ok(created.indexOf("top-2.txt") < created.indexOf("deepest.txt"));
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("bulk upload holds the whole tree to one concurrency ceiling", async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-tree-"));
+  const previousLimit = process.env.AETHEL_DRIVE_CONCURRENCY;
+
+  try {
+    // Deep and wide: the old per-level pools multiplied with nesting depth.
+    let current = workspaceRoot;
+    for (let depth = 0; depth < 4; depth++) {
+      current = path.join(current, `level-${depth}`);
+      await fs.mkdir(current, { recursive: true });
+      for (let i = 0; i < 6; i++) {
+        await fs.writeFile(path.join(current, `file-${i}.txt`), `d${depth}-${i}`);
+      }
+    }
+
+    const drive = createFakeDrive([], { listDelayMs: 2 });
+    let inFlight = 0;
+    let peakInFlight = 0;
+    for (const method of ["create", "list", "update", "get"]) {
+      const original = drive.files[method].bind(drive.files);
+      drive.files[method] = async (params) => {
+        inFlight += 1;
+        peakInFlight = Math.max(peakInFlight, inFlight);
+        try {
+          return await original(params);
+        } finally {
+          inFlight -= 1;
+        }
+      };
+    }
+
+    const result = await syncLocalDirectoryToParent(drive, workspaceRoot, "root");
+
+    assert.equal(result.uploadedFiles, 24);
+    assert.equal(result.uploadedDirectories, 4);
+    assert.ok(
+      peakInFlight <= 40,
+      `expected at most the configured 40 in flight, saw ${peakInFlight}`
+    );
+  } finally {
+    if (previousLimit === undefined) {
+      delete process.env.AETHEL_DRIVE_CONCURRENCY;
+    } else {
+      process.env.AETHEL_DRIVE_CONCURRENCY = previousLimit;
+    }
     await fs.rm(workspaceRoot, { recursive: true, force: true });
   }
 });

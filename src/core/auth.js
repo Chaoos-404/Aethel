@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { URL } from "node:url";
 import { loadGoogleApi } from "./google-api.js";
+import { getDriveAgent } from "./http-agent.js";
 import open from "open";
 
 const SCOPES = ["https://www.googleapis.com/auth/drive"];
@@ -342,5 +343,8 @@ export async function authenticate(credentialsPath, tokenPath, options = {}) {
       : getAuthClient(credentialsPath, tokenPath),
     loadGoogleApi(),
   ]);
-  return drive({ version: "v3", auth: authClient });
+  // Options passed here are merged into every request googleapis makes, so
+  // this single seam gives the whole client a warm connection pool.
+  const agent = getDriveAgent();
+  return drive({ version: "v3", auth: authClient, ...(agent ? { agent } : {}) });
 }
