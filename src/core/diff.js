@@ -113,10 +113,39 @@ function topmostMissingPath(remotePath, pathExists) {
   return remotePath;
 }
 
-export function changesWithLocalAuthority(changes, { pathExists } = {}) {
+export function changesWithLocalAuthority(
+  changes,
+  { pathExists, getLocalMeta } = {}
+) {
   const converted = changes.map((change) => {
     if (change.changeType !== ChangeType.REMOTE_ADDED) {
       return change;
+    }
+
+    // A missing snapshot entry does not prove that the path is absent locally.
+    // An interrupted commit can finish its uploads before persisting the new
+    // snapshot, leaving byte-identical files reported as REMOTE_ADDED. Under
+    // local authority, never translate an existing local path into a remote
+    // deletion. Either it is already converged, or the local bytes should be
+    // uploaded over the remote entry.
+    if (pathExists?.(change.path)) {
+      const localMeta = change.localMeta || getLocalMeta?.(change.path) || null;
+      if (!localMeta) {
+        // The filesystem sees the path but the sync scanner does not. Skipping
+        // is safer than deleting Drive data based on incomplete local metadata.
+        return null;
+      }
+      if (remoteAndLocalEquivalent(change.remoteMeta, localMeta)) {
+        return null;
+      }
+      return createChange({
+        changeType: ChangeType.LOCAL_MODIFIED,
+        path: change.path,
+        fileId: change.fileId,
+        remoteMeta: change.remoteMeta,
+        localMeta,
+        snapshotMeta: change.snapshotMeta,
+      });
     }
 
     const deletePath = topmostMissingPath(change.path, pathExists);
@@ -133,7 +162,9 @@ export function changesWithLocalAuthority(changes, { pathExists } = {}) {
   });
 
   return [...new Map(
-    converted.map((change) => [`${change.suggestedAction}:${change.path}`, change])
+    converted
+      .filter(Boolean)
+      .map((change) => [`${change.suggestedAction}:${change.path}`, change])
   ).values()];
 }
 
@@ -1115,6 +1146,17 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
             snapshotMeta: samePathSnapshot.entry,
           })
         );
+        continue;
+      }
+
+      const matchingLocal = localFilesData[remoteFile.path];
+      if (remoteAndLocalEquivalent(remoteFile, matchingLocal)) {
+        // Neither the remote ID nor its path exists in the snapshot, but the
+        // bytes already agree. This commonly happens when an upload succeeds
+        // and the process exits before saveSnapshot() records the refreshed
+        // Drive manifest. Treat the path as converged instead of scheduling a
+        // redundant pull. A same-path ID replacement is handled above.
+        remoteBaselinePathsHandledLocally.add(remoteFile.path);
         continue;
       }
 

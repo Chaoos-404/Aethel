@@ -480,6 +480,89 @@ test("changesWithLocalAuthority converts remote-only additions into remote delet
   ]);
 });
 
+test("changesWithLocalAuthority drops remote additions already identical locally", () => {
+  const remoteAddition = {
+    changeType: ChangeType.REMOTE_ADDED,
+    path: "docs/already-uploaded.md",
+    fileId: "remote-new-id",
+    remoteMeta: {
+      id: "remote-new-id",
+      path: "docs/already-uploaded.md",
+      md5Checksum: "same-md5",
+    },
+    localMeta: null,
+    snapshotMeta: null,
+    shortStatus: "+R",
+    description: "new on Drive",
+    suggestedAction: "download",
+  };
+  const localMeta = {
+    localPath: "docs/already-uploaded.md",
+    md5: "same-md5",
+  };
+
+  const changes = changesWithLocalAuthority([remoteAddition], {
+    pathExists: () => true,
+    getLocalMeta: () => localMeta,
+  });
+
+  assert.deepEqual(changes, []);
+});
+
+test("changesWithLocalAuthority uploads an existing divergent local file", () => {
+  const remoteAddition = {
+    changeType: ChangeType.REMOTE_ADDED,
+    path: "docs/diverged.md",
+    fileId: "remote-new-id",
+    remoteMeta: {
+      id: "remote-new-id",
+      path: "docs/diverged.md",
+      md5Checksum: "remote-md5",
+    },
+    localMeta: null,
+    snapshotMeta: null,
+    shortStatus: "+R",
+    description: "new on Drive",
+    suggestedAction: "download",
+  };
+  const localMeta = {
+    localPath: "docs/diverged.md",
+    md5: "local-md5",
+  };
+
+  const changes = changesWithLocalAuthority([remoteAddition], {
+    pathExists: () => true,
+    getLocalMeta: () => localMeta,
+  });
+
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0].changeType, ChangeType.LOCAL_MODIFIED);
+  assert.equal(changes[0].suggestedAction, "upload");
+  assert.equal(changes[0].fileId, "remote-new-id");
+  assert.equal(changes[0].localMeta, localMeta);
+});
+
+test("changesWithLocalAuthority never deletes an existing unscanned local path", () => {
+  const remoteAddition = {
+    changeType: ChangeType.REMOTE_ADDED,
+    path: "docs/unscanned.md",
+    fileId: "remote-new-id",
+    remoteMeta: { id: "remote-new-id", path: "docs/unscanned.md" },
+    localMeta: null,
+    snapshotMeta: null,
+    shortStatus: "+R",
+    description: "new on Drive",
+    suggestedAction: "download",
+  };
+
+  const changes = changesWithLocalAuthority([remoteAddition], {
+    pathExists: () => true,
+    getLocalMeta: () => null,
+  });
+
+  assert.deepEqual(changes, []);
+});
+
 test("changesWithLocalAuthority collapses remote-only paths to missing local ancestors", () => {
   const remoteOnly = {
     changeType: ChangeType.REMOTE_ADDED,
@@ -1349,6 +1432,36 @@ test("computeDiff does not conflict when both sides changed to identical content
     diff.changes.filter((change) => change.path === "Notes/report.pdf"),
     []
   );
+});
+
+test("computeDiff ignores an identical remote file omitted from the snapshot manifest", () => {
+  const snapshot = {
+    files: {},
+    localFiles: {
+      "Notes/report.pdf": {
+        localPath: "Notes/report.pdf",
+        md5: "same-md5",
+      },
+    },
+  };
+  const remoteFiles = [
+    {
+      id: "new-remote-id",
+      path: "Notes/report.pdf",
+      md5Checksum: "same-md5",
+      mimeType: "application/pdf",
+    },
+  ];
+  const localFiles = {
+    "Notes/report.pdf": {
+      localPath: "Notes/report.pdf",
+      md5: "same-md5",
+    },
+  };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+
+  assert.deepEqual(diff.changes, []);
 });
 
 test("computeDiff still conflicts when both sides changed to different content", () => {

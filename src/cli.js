@@ -1204,12 +1204,14 @@ async function handlePush(paths, options) {
     const remoteAdditions = diff.remoteChanges.filter(
       (change) => change.changeType === ChangeType.REMOTE_ADDED
     );
+    const localFiles = local?.files ?? local ?? {};
     debug("push remote additions conversion start", { remoteAdditions: remoteAdditions.length });
     localChanges = [
       ...localChanges,
       ...changesWithLocalAuthority(remoteAdditions, {
         pathExists: (relativePath) =>
           fs.existsSync(path.join(repo.root, ...relativePath.split("/"))),
+        getLocalMeta: (relativePath) => localFiles[relativePath] || null,
       }),
     ];
     debug("push remote additions conversion done", { localChanges: localChanges.length });
