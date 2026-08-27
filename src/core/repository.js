@@ -199,6 +199,16 @@ export class Repository {
     this._drive = withDriveRetry(raw);
   }
 
+  /**
+   * Connect on demand and return the drive client. Lets read-only commands
+   * skip authentication entirely when a cached remote listing already answers
+   * the question.
+   */
+  async connectedDrive() {
+    await this.connect();
+    return this._drive;
+  }
+
   // ── Config ──────────────────────────────────────────────────────────
 
   getConfig() {
@@ -223,28 +233,36 @@ export class Repository {
     const config = this.getConfig();
     const t0 = Date.now();
 
-    // Run all three in parallel — remote fetch is the slowest, overlap it
-    // with local scan and snapshot read.
+    // The remote fetch is the slowest leg — overlap it with the local scan.
     const timings = {};
 
-    const [local, snapshot, remoteState] = await Promise.all([
-      scanLocal(this._root).then((r) => {
-        timings.localMs = Date.now() - t0;
-        onPhase?.("local", timings.localMs);
-        return r;
-      }),
-      Promise.resolve(readLatestSnapshot(this._root)).then((r) => {
-        timings.snapshotMs = Date.now() - t0;
-        return r;
-      }),
-      this._loadRemoteState({ useCache, cacheTtlMs: remoteCacheTtlMs }).then((r) => {
-        timings.remoteMs = Date.now() - t0;
-        timings.remoteCached = Boolean(r.cacheTimestamp);
-        timings.remoteCacheAgeMs = r.cacheAgeMs ?? null;
-        onPhase?.("remote", timings.remoteMs);
-        return r;
-      }),
-    ]);
+    // Start the local walk first so its filesystem I/O overlaps the
+    // (synchronous) snapshot read below.
+    const localPromise = scanLocal(this._root).then((r) => {
+      timings.localMs = Date.now() - t0;
+      onPhase?.("local", timings.localMs);
+      return r;
+    });
+
+    const snapshot = readLatestSnapshot(this._root);
+    timings.snapshotMs = Date.now() - t0;
+
+    // Pass the snapshot down: the remote loader sizes its fetch strategy from
+    // it, and re-reading it there costs a second full parse of a file that can
+    // run to tens of megabytes.
+    const remotePromise = this._loadRemoteState({
+      useCache,
+      cacheTtlMs: remoteCacheTtlMs,
+      snapshot,
+    }).then((r) => {
+      timings.remoteMs = Date.now() - t0;
+      timings.remoteCached = Boolean(r.cacheTimestamp);
+      timings.remoteCacheAgeMs = r.cacheAgeMs ?? null;
+      onPhase?.("remote", timings.remoteMs);
+      return r;
+    });
+
+    const [local, remoteState] = await Promise.all([localPromise, remotePromise]);
     const remote = remoteState.files;
 
     const diffStart = Date.now();
@@ -265,8 +283,8 @@ export class Repository {
     };
   }
 
-  async getRemoteState({ useCache = true } = {}) {
-    return this._loadRemoteState({ useCache });
+  async getRemoteState({ useCache = true, snapshot } = {}) {
+    return this._loadRemoteState({ useCache, snapshot });
   }
 
   async scanLocal() {
@@ -766,7 +784,7 @@ export class Repository {
 
   // ── Private helpers ─────────────────────────────────────────────────
 
-  async _loadRemoteState({ useCache = true, cacheTtlMs } = {}) {
+  async _loadRemoteState({ useCache = true, cacheTtlMs, snapshot } = {}) {
     const config = this.getConfig();
     const rootFolderId = config.drive_folder_id || null;
 
@@ -775,7 +793,14 @@ export class Repository {
       : null;
 
     if (!remoteState) {
-      remoteState = await getRemoteState(this.drive, rootFolderId, null, this._remoteFetchOptions());
+      // Only authenticate once we know the cache cannot answer this.
+      const drive = await this.connectedDrive();
+      remoteState = await getRemoteState(
+        drive,
+        rootFolderId,
+        null,
+        this._remoteFetchOptions(snapshot)
+      );
       writeRemoteCache(this._root, remoteState, rootFolderId);
     }
 
@@ -783,10 +808,10 @@ export class Repository {
     return remoteState;
   }
 
-  _remoteFetchOptions() {
-    const snapshot = readLatestSnapshot(this._root);
-    const estimatedRemoteFiles = snapshot?.files
-      ? Object.keys(snapshot.files).length
+  _remoteFetchOptions(snapshot) {
+    const resolved = snapshot === undefined ? readLatestSnapshot(this._root) : snapshot;
+    const estimatedRemoteFiles = resolved?.files
+      ? Object.keys(resolved.files).length
       : null;
     return { estimatedRemoteFiles };
   }

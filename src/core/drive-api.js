@@ -362,31 +362,64 @@ async function fetchScopedItems(drive, rootFolderId, { fields = DEFAULT_ITEM_FIE
     folders.set(rootResponse.data.id, rootResponse.data);
   }
 
-  let currentLevel = [rootFolderId];
-  while (currentLevel.length > 0) {
-    const nextLevel = [];
-    for (let index = 0; index < currentLevel.length; index += DRIVE_API_CONCURRENCY) {
-      const batch = currentLevel.slice(index, index + DRIVE_API_CONCURRENCY);
-      const batchChildren = await Promise.all(
-        batch.map((parentId) => listChildItems(drive, parentId, { fields }))
-      );
+  // Traverse with a continuously-refilled pool rather than level-by-level
+  // batches. A batched breadth-first walk idles on two barriers: every request
+  // in a batch waits for the slowest one, and every level waits for the whole
+  // level above it. Here a folder discovered by any in-flight request becomes
+  // available to the next free slot immediately, so all DRIVE_API_CONCURRENCY
+  // slots stay busy until the tree is exhausted.
+  //
+  // The queue is FIFO over an index cursor — breadth-first order (which the
+  // request-order tests pin), O(1) dequeue.
+  const queue = [rootFolderId];
+  let queueCursor = 0;
+  let active = 0;
+  let settled = false;
 
-      for (const children of batchChildren) {
-        for (const item of children) {
-          if (item.mimeType === FOLDER_MIME) {
+  await new Promise((resolve, reject) => {
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+
+    const pump = () => {
+      if (settled) return;
+
+      if (queueCursor >= queue.length && active === 0) {
+        settled = true;
+        resolve();
+        return;
+      }
+
+      while (active < DRIVE_API_CONCURRENCY && queueCursor < queue.length) {
+        const parentId = queue[queueCursor];
+        queueCursor += 1;
+        active += 1;
+
+        listChildItems(drive, parentId, { fields }).then((children) => {
+          for (const item of children) {
+            if (item.mimeType !== FOLDER_MIME) {
+              files.push(item);
+              continue;
+            }
             folders.set(item.id, item);
             if (!seenFolderIds.has(item.id)) {
               seenFolderIds.add(item.id);
-              nextLevel.push(item.id);
+              queue.push(item.id);
             }
-          } else {
-            files.push(item);
           }
-        }
+          active -= 1;
+          pump();
+        }, (err) => {
+          active -= 1;
+          fail(err);
+        });
       }
-    }
-    currentLevel = nextLevel;
-  }
+    };
+
+    pump();
+  });
 
   return { folders, files };
 }

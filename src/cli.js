@@ -170,13 +170,16 @@ function addAuthOptions(command) {
     .option("--token <path>", "Path to cached OAuth token JSON");
 }
 
-async function openRepo(options, { requireWorkspace = true, silent = false } = {}) {
+async function openRepo(options, { requireWorkspace = true, silent = false, connect = true } = {}) {
   const root = requireWorkspace ? requireRoot() : null;
   const repo = await createRepository(root, {
     credentials: options.credentials,
     token: options.token,
     forceAuth: options.forceAuth,
   });
+  if (!connect) {
+    return repo;
+  }
   const spinner = silent ? null : createSpinner("Connecting to Google Drive...");
   try {
     await repo.connect();
@@ -693,7 +696,9 @@ async function handleInit(options) {
 }
 
 async function handleStatus(options) {
-  const repo = await openRepo(options);
+  // `status` is read-only and usually served straight from the remote cache,
+  // so let Repository authenticate lazily — only if it actually has to fetch.
+  const repo = await openRepo(options, { connect: false });
   const { diff } = await loadStateWithProgress(repo, {
     useCache: remoteCacheEnabledByDefault("status"),
     remoteCacheTtlMs: Number.POSITIVE_INFINITY,
@@ -963,14 +968,28 @@ async function handleFetch(options) {
   repo.invalidateRemoteCache();
   const fetchStart = Date.now();
   const spinner = createSpinner("Fetching remote file list...");
-  const remoteState = await repo.getRemoteState({ useCache: false });
-  const remote = remoteState.files;
+
+  // The local scan is pure filesystem work and the remote listing is pure
+  // network work — overlap them instead of paying for both end to end.
+  const snapshot = repo.getSnapshot();
+  const [remoteResult, localResult] = await Promise.allSettled([
+    repo.getRemoteState({ useCache: false, snapshot }),
+    snapshot ? repo.scanLocal() : Promise.resolve(null),
+  ]);
+
+  if (remoteResult.status === "rejected") {
+    spinner.fail("Failed to fetch remote file list");
+    throw remoteResult.reason;
+  }
+  const remote = remoteResult.value.files;
   spinner.succeed(`Found ${remote.length} file(s) on Drive [${fmtMs(Date.now() - fetchStart)}]`);
 
-  const snapshot = repo.getSnapshot();
+  if (localResult.status === "rejected") {
+    throw localResult.reason;
+  }
+
   if (snapshot) {
-    const local = await repo.scanLocal();
-    const diff = repo.computeDiff(snapshot, remote, local);
+    const diff = repo.computeDiff(snapshot, remote, localResult.value);
     const remoteChanges = diff.remoteChanges;
     const conflicts = diff.conflicts;
 

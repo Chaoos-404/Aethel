@@ -91,6 +91,15 @@ function saveHashCache(root, cache) {
 
 const PARALLEL_HASH_LIMIT = 128;
 
+/** Rebuild an object with its keys in sorted order (walk order is not stable). */
+function sortObjectKeys(source) {
+  const sorted = {};
+  for (const key of Object.keys(source).sort()) {
+    sorted[key] = source[key];
+  }
+  return sorted;
+}
+
 export async function scanLocal(root, { respectIgnore = true, respectPacking = true } = {}) {
   const resolvedRoot = path.resolve(root);
   const ignoreRules = respectIgnore ? loadIgnoreRules(resolvedRoot) : null;
@@ -98,6 +107,9 @@ export async function scanLocal(root, { respectIgnore = true, respectPacking = t
   const packingEnabled = packConfig?.packing?.enabled === true;
   const hashCache = loadHashCache(resolvedRoot);
   const nextCache = new Map();
+  // Read-only commands (status, diff, fetch) scan without changing anything;
+  // don't rewrite the cache file when no entry actually moved.
+  let hashCacheDirty = false;
 
   // Phase 1: collect all file stats (fast — no hashing yet)
   const filesToHash = [];
@@ -209,6 +221,13 @@ export async function scanLocal(root, { respectIgnore = true, respectPacking = t
 
   await walk(resolvedRoot);
 
+  // The walk collects stats as they resolve, so `filesToHash` arrives in
+  // completion order. Sort it: the insertion order of `result` becomes the
+  // order changes are reported in, and that should not shuffle between runs.
+  filesToHash.sort((left, right) =>
+    left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0
+  );
+
   // Phase 2: hash files in parallel batches, using cache when possible
   const result = {};
 
@@ -217,7 +236,14 @@ export async function scanLocal(root, { respectIgnore = true, respectPacking = t
     const hashes = await Promise.all(
       batch.map(async ({ fullPath, relativePath, stat }) => {
         try {
-          const md5 = await getMd5Cached(hashCache, nextCache, fullPath, relativePath, stat);
+          const { md5, fromCache } = await getMd5Cached(
+            hashCache,
+            nextCache,
+            fullPath,
+            relativePath,
+            stat
+          );
+          if (!fromCache) hashCacheDirty = true;
           return { relativePath, stat, md5 };
         } catch (err) {
           if (isMissingLocalFileError(err)) {
@@ -265,32 +291,40 @@ export async function scanLocal(root, { respectIgnore = true, respectPacking = t
     }
   }
 
-  // Only stat the empty directories (not all directories)
-  await Promise.all([...emptyDirs].map(async (dirPath) => {
-    let mtime = new Date().toISOString();
+  // Only stat the empty directories (not all directories). Stat in parallel,
+  // then record in sorted order so the result stays deterministic.
+  const sortedEmptyDirs = [...emptyDirs].sort();
+  const emptyDirMtimes = await Promise.all(sortedEmptyDirs.map(async (dirPath) => {
     const absPath = dirAbsPath.get(dirPath);
     if (absPath) {
       try {
         const stat = await fs.promises.stat(absPath);
-        mtime = new Date(stat.mtimeMs).toISOString();
+        return new Date(stat.mtimeMs).toISOString();
       } catch { /* ignore */ }
     }
+    return new Date().toISOString();
+  }));
+
+  sortedEmptyDirs.forEach((dirPath, index) => {
     result[dirPath] = {
       localPath: dirPath,
       isFolder: true,
       size: 0,
       md5: null,
-      modifiedTime: mtime,
+      modifiedTime: emptyDirMtimes[index],
     };
-  }));
+  });
 
-  // Persist updated cache
-  saveHashCache(resolvedRoot, nextCache);
+  // Persist updated cache. A pure cache hit for every scanned file still
+  // leaves entries behind if files were deleted, so compare sizes too.
+  if (hashCacheDirty || nextCache.size !== hashCache.size) {
+    saveHashCache(resolvedRoot, nextCache);
+  }
 
   // Return both files and packed directories
   return {
     files: result,
-    packedDirs,
+    packedDirs: sortObjectKeys(packedDirs),
     // For backward compatibility, also expose files at top level
     ...result,
   };
@@ -301,16 +335,18 @@ async function getMd5Cached(oldCache, newCache, fullPath, relativePath, stat) {
   const cached = oldCache.get(relativePath);
 
   let md5;
+  let fromCache = false;
   if (cached && cached.startsWith(key + ":")) {
     // Cache hit: mtime and size match
     md5 = cached.slice(key.length + 1);
+    fromCache = true;
   } else {
     // Cache miss: compute hash
     md5 = await md5Local(fullPath);
   }
 
   newCache.set(relativePath, `${key}:${md5}`);
-  return md5;
+  return { md5, fromCache };
 }
 
 // ── Snapshot building ────────────────────────────────────────────────

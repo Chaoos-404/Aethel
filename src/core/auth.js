@@ -4,7 +4,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { URL } from "node:url";
-import { google } from "googleapis";
+import { loadGoogleApi } from "./google-api.js";
 import open from "open";
 
 const SCOPES = ["https://www.googleapis.com/auth/drive"];
@@ -93,7 +93,7 @@ async function loadClientConfig(credentialsPath) {
   };
 }
 
-function createOAuthClient(config, redirectUri) {
+async function createOAuthClient(config, redirectUri) {
   const fallbackRedirect =
     config.redirectUris.find(
       (uri) =>
@@ -102,7 +102,8 @@ function createOAuthClient(config, redirectUri) {
     config.redirectUris[0] ||
     "http://127.0.0.1";
 
-  return new google.auth.OAuth2(
+  const { OAuth2 } = await loadGoogleApi();
+  return new OAuth2(
     config.clientId,
     config.clientSecret,
     redirectUri || fallbackRedirect
@@ -142,7 +143,7 @@ async function loadCachedClient(config, tokenPath) {
     return null;
   }
 
-  const client = createOAuthClient(config);
+  const client = await createOAuthClient(config);
   attachTokenPersistence(client, tokenPath);
   client.setCredentials(token);
 
@@ -232,7 +233,7 @@ async function runLocalServerAuth(config, tokenPath) {
         const port = typeof address === "object" && address ? address.port : 0;
         const redirectUri = `http://127.0.0.1:${port}/oauth2callback`;
 
-        oauthClient = createOAuthClient(config, redirectUri);
+        oauthClient = await createOAuthClient(config, redirectUri);
         attachTokenPersistence(oauthClient, tokenPath);
 
         const authUrl = oauthClient.generateAuthUrl({
@@ -331,12 +332,15 @@ export function resetAuth() {
 
 /**
  * High-level entry point: returns a googleapis drive client.
- * Kept for backwards compatibility — prefer getAuthClient + google.drive
+ * Kept for backwards compatibility — prefer getAuthClient + loadGoogleApi
  * for finer control.
  */
 export async function authenticate(credentialsPath, tokenPath, options = {}) {
-  const authClient = options.force
-    ? await refreshAuthClient(credentialsPath, tokenPath)
-    : await getAuthClient(credentialsPath, tokenPath);
-  return google.drive({ version: "v3", auth: authClient });
+  const [authClient, { drive }] = await Promise.all([
+    options.force
+      ? refreshAuthClient(credentialsPath, tokenPath)
+      : getAuthClient(credentialsPath, tokenPath),
+    loadGoogleApi(),
+  ]);
+  return drive({ version: "v3", auth: authClient });
 }
