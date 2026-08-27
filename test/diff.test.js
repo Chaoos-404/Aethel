@@ -676,6 +676,12 @@ test("computeDiff collapses local deletion of non-empty remote folder to parent 
         localPath: "build/app.dSYM/Contents/Resources/DWARF/app",
         md5Checksum: "binary-md5",
       },
+      "remote-keep": {
+        id: "remote-keep",
+        path: "build/keep.txt",
+        localPath: "build/keep.txt",
+        md5Checksum: "keep-md5",
+      },
     },
     localFiles: {
       "build/app.dSYM/Contents/Info.plist": {
@@ -685,6 +691,10 @@ test("computeDiff collapses local deletion of non-empty remote folder to parent 
       "build/app.dSYM/Contents/Resources/DWARF/app": {
         localPath: "build/app.dSYM/Contents/Resources/DWARF/app",
         md5: "binary-md5",
+      },
+      "build/keep.txt": {
+        localPath: "build/keep.txt",
+        md5: "keep-md5",
       },
     },
   };
@@ -705,9 +715,16 @@ test("computeDiff collapses local deletion of non-empty remote folder to parent 
       path: "build/app.dSYM/Contents/Resources/DWARF/app",
       md5Checksum: "binary-md5",
     },
+    {
+      id: "remote-keep",
+      path: "build/keep.txt",
+      md5Checksum: "keep-md5",
+    },
   ];
 
-  const diff = computeDiff(snapshot, remoteFiles, {});
+  const diff = computeDiff(snapshot, remoteFiles, {
+    "build/keep.txt": { localPath: "build/keep.txt", md5: "keep-md5" },
+  });
 
   assert.deepEqual(
     diff.changes.map((change) => ({
@@ -724,6 +741,93 @@ test("computeDiff collapses local deletion of non-empty remote folder to parent 
         fileId: "remote-folder",
       },
     ]
+  );
+});
+
+test("computeDiff deletes the folder itself when a locally deleted folder is only implicit", () => {
+  // Non-empty folders appear in neither the remote listing nor the local
+  // scan, so a deleted local folder used to surface only its files — the
+  // trashed files then left an empty folder husk behind on Drive.
+  const snapshot = {
+    files: {
+      "remote-file": {
+        id: "remote-file",
+        path: "notes/deep/todo.md",
+        localPath: "notes/deep/todo.md",
+        md5Checksum: "todo-md5",
+      },
+      "remote-keep": {
+        id: "remote-keep",
+        path: "keep.txt",
+        localPath: "keep.txt",
+        md5Checksum: "keep-md5",
+      },
+    },
+    localFiles: {
+      "notes/deep/todo.md": {
+        localPath: "notes/deep/todo.md",
+        md5: "todo-md5",
+      },
+      "keep.txt": { localPath: "keep.txt", md5: "keep-md5" },
+    },
+  };
+
+  const remoteFiles = [
+    { id: "remote-file", path: "notes/deep/todo.md", md5Checksum: "todo-md5" },
+    { id: "remote-keep", path: "keep.txt", md5Checksum: "keep-md5" },
+  ];
+
+  const diff = computeDiff(snapshot, remoteFiles, {
+    "keep.txt": { localPath: "keep.txt", md5: "keep-md5" },
+  });
+
+  assert.deepEqual(
+    diff.changes.map((change) => ({
+      type: change.changeType,
+      path: change.path,
+      action: change.suggestedAction,
+      fileId: change.fileId,
+    })),
+    [
+      {
+        type: ChangeType.LOCAL_DELETED,
+        path: "notes",
+        action: "delete_remote",
+        fileId: null,
+      },
+    ]
+  );
+});
+
+test("computeDiff keeps a remotely edited file out of a locally deleted folder's collapse", () => {
+  const snapshot = {
+    files: {
+      "remote-file": {
+        id: "remote-file",
+        path: "notes/todo.md",
+        localPath: "notes/todo.md",
+        md5Checksum: "old-md5",
+      },
+    },
+    localFiles: {
+      "notes/todo.md": { localPath: "notes/todo.md", md5: "old-md5" },
+    },
+  };
+
+  const remoteFiles = [
+    { id: "remote-file", path: "notes/todo.md", md5Checksum: "new-md5" },
+  ];
+
+  const diff = computeDiff(snapshot, remoteFiles, {});
+
+  // The remote edit must surface as a conflict; the folder deletion must not
+  // trash the edited file behind the user's back.
+  assert.deepEqual(
+    diff.changes.map((change) => ({
+      type: change.changeType,
+      path: change.path,
+    })),
+    [{ type: ChangeType.CONFLICT, path: "notes/todo.md" }]
   );
 });
 

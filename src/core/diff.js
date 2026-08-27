@@ -491,9 +491,15 @@ function computePackChanges(root, packedDirs, snapshot) {
 function collectFolderPaths(filePaths) {
   const folders = new Set();
   for (const p of filePaths) {
-    const parts = p.split("/");
-    for (let i = 1; i < parts.length; i++) {
-      folders.add(parts.slice(0, i).join("/"));
+    // Walk ancestors right-to-left with substrings instead of split/slice/join:
+    // once an ancestor is already recorded so are all of *its* ancestors, so
+    // sibling files in the same directory cost a single lookup.
+    let slashIndex = p.lastIndexOf("/");
+    while (slashIndex > 0) {
+      const folder = p.slice(0, slashIndex);
+      if (folders.has(folder)) break;
+      folders.add(folder);
+      slashIndex = p.lastIndexOf("/", slashIndex - 1);
     }
   }
   return folders;
@@ -1316,6 +1322,68 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
     }
   }
 
+  // A folder that contains files has no explicit entry on either side of the
+  // snapshot: remote listings and local scans only record empty folders.
+  // Deleting such a folder locally would therefore only surface its files,
+  // and trashing those one by one leaves an empty folder husk behind on
+  // Drive that the next sync resurrects locally. Surface the topmost deleted
+  // folder itself so the whole remote tree is trashed with it.
+  const remoteOccupiedIndex = indexPathsForAncestry(
+    changes
+      .filter(
+        (change) =>
+          change.changeType === ChangeType.REMOTE_ADDED ||
+          change.changeType === ChangeType.REMOTE_MODIFIED ||
+          change.changeType === ChangeType.REMOTE_RENAMED ||
+          change.changeType === ChangeType.CONFLICT
+      )
+      .map((change) => change.path)
+  );
+  for (const folderPath of [...snapshotLocalIndex.folderSet].sort(
+    (left, right) =>
+      left.split("/").length - right.split("/").length ||
+      left.localeCompare(right)
+  )) {
+    if (
+      locallyDeletedFolders.has(folderPath) ||
+      isUnderAnyFolder(folderPath, locallyDeletedFolders)
+    ) {
+      continue;
+    }
+    // Only a folder that vanished locally in full counts as deleted.
+    if (hasPathOrDescendant(currentLocalIndex, folderPath)) continue;
+    // Nothing to delete when the folder is gone from Drive as well.
+    if (!remoteFolderPaths.has(folderPath)) continue;
+    // A locally renamed folder is missing from its old path by design.
+    if (isRenamedDescendant(folderPath, localPathRenames)) continue;
+    // Remote-side changes underneath (edits, additions, renames, conflicts)
+    // must win over the folder deletion — they resolve at the file level.
+    if (hasPathOrDescendant(remoteOccupiedIndex, folderPath)) continue;
+
+    locallyDeletedFolders.add(folderPath);
+    // Trashing this folder covers every deletion already collapsed beneath it.
+    const subtreePrefix = `${folderPath}/`;
+    for (let index = changes.length - 1; index >= 0; index--) {
+      if (
+        changes[index].changeType === ChangeType.LOCAL_DELETED &&
+        changes[index].path.startsWith(subtreePrefix)
+      ) {
+        changes.splice(index, 1);
+      }
+    }
+    const remoteFolder = remoteByPath.get(folderPath);
+    changes.push(
+      createChange({
+        changeType: ChangeType.LOCAL_DELETED,
+        path: folderPath,
+        fileId:
+          remoteFolder?.id || snapshotRemoteByPath.get(folderPath)?.fileId || null,
+        remoteMeta: remoteFolder || null,
+        snapshotMeta: folderSnapshotMeta(folderPath, snapshotRemoteByPath),
+      })
+    );
+  }
+
   const localRenameTargets = new Set(
     locallyRenamedFolders.map((rename) => rename.to)
   );
@@ -1424,7 +1492,10 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
       continue;
     }
     if (!(relativePath in localFilesData)) {
-      if (isUnderAnyFolder(relativePath, locallyDeletedFolders)) {
+      if (
+        locallyDeletedFolders.has(relativePath) ||
+        isUnderAnyFolder(relativePath, locallyDeletedFolders)
+      ) {
         continue;
       }
 

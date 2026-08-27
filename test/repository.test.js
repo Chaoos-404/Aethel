@@ -9,6 +9,8 @@ import { computeDiff, ChangeType } from "../src/core/diff.js";
 import { writeRemoteCache } from "../src/core/remote-cache.js";
 import { conflictResolutionChange } from "../src/core/staging.js";
 
+const FOLDER_MIME = "application/vnd.google-apps.folder";
+
 function makeTmpWorkspace() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "aethel-repo-test-"));
   initWorkspace(root, "fake-folder-id", "Test Drive");
@@ -568,6 +570,73 @@ test("pull snapshots retain local-only additions and local modifications", async
   }
 });
 
+test("loadState served from cache never authenticates", async () => {
+  const root = makeTmpWorkspace();
+  try {
+    writeRemoteCache(root, {
+      files: [
+        {
+          id: "remote-1",
+          path: "remote.txt",
+          name: "remote.txt",
+          mimeType: "text/plain",
+          md5Checksum: "remote-md5",
+        },
+      ],
+      duplicateFolders: [],
+    }, "fake-folder-id");
+
+    // No drive and no credentials: connecting would throw, so a cache-served
+    // status proves authentication was skipped entirely.
+    const repo = new Repository(root, {
+      credentials: path.join(root, "definitely-missing-credentials.json"),
+      token: path.join(root, "definitely-missing-token.json"),
+    });
+
+    const state = await repo.loadState({
+      useCache: true,
+      remoteCacheTtlMs: Number.POSITIVE_INFINITY,
+    });
+
+    assert.equal(state.remoteState.files.length, 1);
+    assert.equal(state.timings.remoteCached, true);
+    assert.equal(repo.isConnected, false);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("loadState connects on demand when the remote cache misses", async () => {
+  const root = makeTmpWorkspace();
+  try {
+    let connects = 0;
+    const repo = new Repository(root, {
+      credentials: path.join(root, "definitely-missing-credentials.json"),
+      token: path.join(root, "definitely-missing-token.json"),
+    });
+    repo.connect = async () => {
+      connects += 1;
+      repo._drive = {
+        files: {
+          async list() {
+            return { data: { files: [], nextPageToken: null } };
+          },
+          async get() {
+            return { data: { id: "fake-folder-id", name: "root", mimeType: FOLDER_MIME, parents: [] } };
+          },
+        },
+      };
+    };
+
+    const state = await repo.loadState({ useCache: false });
+
+    assert.equal(connects, 1);
+    assert.equal(state.timings.remoteCached, false);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("loadState can use an expired remote cache for fast status", async () => {
   const root = makeTmpWorkspace();
   try {
@@ -716,6 +785,63 @@ test("pull snapshots keep a local edit pending across a remote folder rename", a
       [{ type: ChangeType.LOCAL_MODIFIED, path: "archive/notes.md" }]
     );
     assert.equal(diff.changes[0].fileId, "child");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("executeStaged trashes a locally deleted folder that has no tracked Drive ID", async () => {
+  // A folder that contained files is listed on neither side of the snapshot,
+  // so its staged deletion carries no fileId — the executor must resolve the
+  // folder by path and trash it, not leave an empty husk on Drive.
+  const root = makeTmpWorkspace();
+  try {
+    const trashed = [];
+    const listQueries = [];
+    const repo = new Repository(root, {
+      drive: {
+        files: {
+          async list({ q }) {
+            listQueries.push(q);
+            return {
+              data: {
+                files: [
+                  {
+                    id: "notes-folder-id",
+                    name: "notes",
+                    mimeType: FOLDER_MIME,
+                    parents: ["fake-folder-id"],
+                  },
+                ],
+              },
+            };
+          },
+          async update({ fileId, requestBody }) {
+            trashed.push({ fileId, requestBody });
+            return { data: { id: fileId } };
+          },
+        },
+      },
+    });
+
+    repo.stageChange({
+      path: "notes",
+      suggestedAction: "delete_remote",
+      snapshotMeta: { path: "notes", localPath: "notes", isFolder: true },
+    });
+
+    const result = await repo.executeStaged();
+
+    assert.equal(result.deletedRemote, 1);
+    assert.deepEqual(result.errors, []);
+    assert.deepEqual(trashed, [
+      { fileId: "notes-folder-id", requestBody: { trashed: true } },
+    ]);
+    assert.ok(
+      listQueries.some((q) => q.includes("'fake-folder-id' in parents")),
+      "folder must be resolved under the configured Drive root"
+    );
+    assert.equal(repo.getStagedEntries().length, 0);
   } finally {
     cleanup(root);
   }
