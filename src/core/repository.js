@@ -72,6 +72,57 @@ function isTrackedBySnapshot(pathValue, snapshotFiles) {
   });
 }
 
+/**
+ * Paths covered by Drive: every remote path plus each of its ancestors.
+ *
+ * Equivalent to testing isTrackedBySnapshot() against every path, but built
+ * once instead of scanning the whole remote list per local file.
+ */
+function buildRemoteCoverage(remoteFiles) {
+  const covered = new Set();
+
+  for (const file of remoteFiles || []) {
+    const pathValue = file?.path;
+    if (!pathValue) continue;
+
+    covered.add(pathValue);
+    const parts = pathValue.split("/");
+    while (parts.length > 1) {
+      parts.pop();
+      covered.add(parts.join("/"));
+    }
+  }
+
+  return covered;
+}
+
+/**
+ * Keep only local baseline entries that are backed by a Drive item.
+ *
+ * A file recorded here without a remote counterpart matches its own baseline
+ * forever, so no later diff reports it and `aethel add` — which can only stage
+ * entries present in the diff — can never reach it. The file becomes invisible
+ * and is never uploaded. buildPulledLocalSnapshot() already enforces this
+ * invariant on the pull path; ordinary syncs need it too.
+ *
+ * Safe against dropping a just-uploaded file: push re-fetches remote state
+ * after the upload completes, so successful uploads are present here, while a
+ * failed upload is correctly left out and retried on the next sync.
+ */
+function buildSyncedLocalSnapshot(scannedLocal, remoteFiles) {
+  const scannedLocalFiles = scannedLocal?.files ?? scannedLocal ?? {};
+  const covered = buildRemoteCoverage(remoteFiles);
+  const files = {};
+
+  for (const [pathValue, entry] of Object.entries(scannedLocalFiles)) {
+    if (covered.has(pathValue)) {
+      files[pathValue] = entry;
+    }
+  }
+
+  return { files, packedDirs: scannedLocal?.packedDirs ?? {} };
+}
+
 function removePathAndDescendants(files, pathValue) {
   for (const candidate of Object.keys(files)) {
     if (isPathOrDescendant(candidate, pathValue)) {
@@ -387,7 +438,7 @@ export class Repository {
           ),
           packedDirs: localFiles?.packedDirs ?? {},
         }
-      : localFiles;
+      : buildSyncedLocalSnapshot(localFiles, remoteState.files);
     const snapshot = buildSnapshot(remoteState.files, snapshotLocalFiles, message);
     writeSnapshot(this._root, snapshot);
     this.updateCurrentBranch(snapshot);

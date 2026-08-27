@@ -896,6 +896,15 @@ test("computeDiff treats remote additions under a locally deleted snapshot folde
         action: "delete_remote",
         fileId: "compiler-folder",
       },
+      // AP325/main.c has a local baseline but has never existed on Drive, so it
+      // must surface as an upload. The folder delete above is still collapsed to
+      // the single parent, which is what this test guards.
+      {
+        type: ChangeType.LOCAL_ADDED,
+        path: "01_Courses/03_C/AP325/main.c",
+        action: "upload",
+        fileId: null,
+      },
     ]
   );
 });
@@ -1299,4 +1308,272 @@ test("computeDiff stays quiet when both sides renamed a non-empty folder identic
   };
 
   assert.deepEqual(computeDiff(snapshot, remoteFiles, localFiles).changes, []);
+});
+
+test("computeDiff does not conflict when both sides changed to identical content", () => {
+  // Both machines wrote the same bytes, so each side differs from the synced
+  // baseline while agreeing with the other. There is nothing to reconcile.
+  const snapshot = {
+    files: {
+      "file-1": {
+        id: "file-1",
+        path: "Notes/report.pdf",
+        localPath: "Notes/report.pdf",
+        md5Checksum: "baseline-md5",
+      },
+    },
+    localFiles: {
+      "Notes/report.pdf": { localPath: "Notes/report.pdf", md5: "baseline-md5" },
+    },
+  };
+
+  const remoteFiles = [
+    {
+      id: "file-1",
+      path: "Notes/report.pdf",
+      md5Checksum: "converged-md5",
+      mimeType: "application/pdf",
+      modifiedTime: "2026-08-27T06:46:12.303Z",
+    },
+  ];
+
+  const localFiles = {
+    "Notes/report.pdf": { localPath: "Notes/report.pdf", md5: "converged-md5" },
+  };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+
+  assert.equal(diff.conflicts.length, 0);
+  // Neither a redundant upload nor a redundant download should be scheduled.
+  assert.deepEqual(
+    diff.changes.filter((change) => change.path === "Notes/report.pdf"),
+    []
+  );
+});
+
+test("computeDiff still conflicts when both sides changed to different content", () => {
+  const snapshot = {
+    files: {
+      "file-1": {
+        id: "file-1",
+        path: "Notes/report.pdf",
+        localPath: "Notes/report.pdf",
+        md5Checksum: "baseline-md5",
+      },
+    },
+    localFiles: {
+      "Notes/report.pdf": { localPath: "Notes/report.pdf", md5: "baseline-md5" },
+    },
+  };
+
+  const remoteFiles = [
+    {
+      id: "file-1",
+      path: "Notes/report.pdf",
+      md5Checksum: "remote-md5",
+      mimeType: "application/pdf",
+    },
+  ];
+
+  const localFiles = {
+    "Notes/report.pdf": { localPath: "Notes/report.pdf", md5: "local-md5" },
+  };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+
+  assert.deepEqual(
+    diff.changes.map((change) => change.changeType),
+    [ChangeType.CONFLICT]
+  );
+  assert.equal(diff.changes[0].remoteMeta.md5Checksum, "remote-md5");
+  assert.equal(diff.changes[0].localMeta.md5, "local-md5");
+});
+
+test("computeDiff treats a Workspace document with no checksum as a conflict", () => {
+  // Workspace files carry no md5; equal timestamps would not prove equal content,
+  // so these must never be silently treated as converged.
+  const snapshot = {
+    files: {
+      "doc-1": {
+        id: "doc-1",
+        path: "Notes/plan",
+        localPath: "Notes/plan",
+        modifiedTime: "2026-08-01T00:00:00Z",
+        mimeType: "application/vnd.google-apps.document",
+      },
+    },
+    localFiles: { "Notes/plan": { localPath: "Notes/plan", md5: "baseline-md5" } },
+  };
+
+  const remoteFiles = [
+    {
+      id: "doc-1",
+      path: "Notes/plan",
+      mimeType: "application/vnd.google-apps.document",
+      modifiedTime: "2026-08-27T06:46:12.303Z",
+    },
+  ];
+
+  const localFiles = { "Notes/plan": { localPath: "Notes/plan", md5: "local-md5" } };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+
+  assert.equal(diff.conflicts.length, 1);
+  assert.equal(diff.conflicts[0].path, "Notes/plan");
+});
+
+test("computeDiff surfaces a locally tracked file that never reached Drive", () => {
+  // saveSnapshot() records every scanned file in localFiles whether or not the
+  // upload succeeded. Such a file matches its baseline forever, so without an
+  // explicit check it produces no change and can never be staged.
+  const snapshot = {
+    files: {},
+    localFiles: {
+      "Library/reading/book.epub": {
+        localPath: "Library/reading/book.epub",
+        md5: "book-md5",
+      },
+    },
+  };
+
+  const remoteFiles = [];
+  const localFiles = {
+    "Library/reading/book.epub": {
+      localPath: "Library/reading/book.epub",
+      md5: "book-md5",
+    },
+  };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+  const change = diff.changes.find((c) => c.path === "Library/reading/book.epub");
+
+  assert.equal(change?.changeType, ChangeType.LOCAL_ADDED);
+  assert.equal(change?.suggestedAction, "upload");
+});
+
+test("computeDiff does not re-upload a file deleted on Drive after syncing", () => {
+  // The file DID reach Drive once, so its absence is a remote deletion to apply
+  // locally. Re-uploading would silently resurrect what the user deleted.
+  const snapshot = {
+    files: {
+      "file-1": {
+        id: "file-1",
+        path: "Library/reading/book.epub",
+        localPath: "Library/reading/book.epub",
+        md5Checksum: "book-md5",
+      },
+    },
+    localFiles: {
+      "Library/reading/book.epub": {
+        localPath: "Library/reading/book.epub",
+        md5: "book-md5",
+      },
+    },
+  };
+
+  const remoteFiles = [];
+  const localFiles = {
+    "Library/reading/book.epub": {
+      localPath: "Library/reading/book.epub",
+      md5: "book-md5",
+    },
+  };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+
+  // Nothing may be scheduled for upload — that would resurrect a file the user
+  // deleted on Drive. The deletion itself collapses to the parent folder, which
+  // is pre-existing behaviour this fix leaves untouched.
+  assert.deepEqual(
+    diff.changes.filter((c) => c.changeType === ChangeType.LOCAL_ADDED),
+    []
+  );
+  assert.deepEqual(
+    diff.changes.map((c) => ({ type: c.changeType, path: c.path, action: c.suggestedAction })),
+    [{ type: ChangeType.REMOTE_DELETED, path: "Library", action: "delete_local" }]
+  );
+});
+
+test("computeDiff stays quiet for an unchanged file that is present on Drive", () => {
+  const snapshot = {
+    files: {
+      "file-1": {
+        id: "file-1",
+        path: "Library/reading/book.epub",
+        localPath: "Library/reading/book.epub",
+        md5Checksum: "book-md5",
+      },
+    },
+    localFiles: {
+      "Library/reading/book.epub": {
+        localPath: "Library/reading/book.epub",
+        md5: "book-md5",
+      },
+    },
+  };
+
+  const remoteFiles = [
+    { id: "file-1", path: "Library/reading/book.epub", md5Checksum: "book-md5" },
+  ];
+  const localFiles = {
+    "Library/reading/book.epub": {
+      localPath: "Library/reading/book.epub",
+      md5: "book-md5",
+    },
+  };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+
+  assert.deepEqual(diff.changes, []);
+});
+
+test("computeDiff does not stage a deletion for a path Drive never had", () => {
+  // Mirror of the never-uploaded case: the local file is gone, but it never
+  // reached Drive, so there is nothing remote to delete.
+  const snapshot = {
+    files: {},
+    localFiles: {
+      "Library/reading/gone.epub": {
+        localPath: "Library/reading/gone.epub",
+        md5: "gone-md5",
+      },
+    },
+  };
+
+  const diff = computeDiff(snapshot, [], {});
+
+  assert.deepEqual(diff.changes, []);
+});
+
+test("computeDiff still stages a deletion for a file that exists on Drive", () => {
+  const snapshot = {
+    files: {
+      "file-1": {
+        id: "file-1",
+        path: "Library/reading/book.epub",
+        localPath: "Library/reading/book.epub",
+        md5Checksum: "book-md5",
+      },
+    },
+    localFiles: {
+      "Library/reading/book.epub": {
+        localPath: "Library/reading/book.epub",
+        md5: "book-md5",
+      },
+    },
+  };
+
+  const remoteFiles = [
+    { id: "file-1", path: "Library/reading/book.epub", md5Checksum: "book-md5" },
+  ];
+
+  const diff = computeDiff(snapshot, remoteFiles, {});
+  const change = diff.changes.find((c) => c.changeType === ChangeType.LOCAL_DELETED);
+
+  // The whole folder went away locally, so the deletion collapses to the parent
+  // rather than naming the file — pre-existing behaviour. What matters here is
+  // that a real Drive file still produces a deletion at all.
+  assert.ok(change, "a real Drive file must still be staged for deletion");
+  assert.equal(change.path, "Library");
+  assert.equal(change.suggestedAction, "delete_remote");
 });

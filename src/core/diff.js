@@ -202,6 +202,33 @@ function localChanged(snapshotEntry, localEntry) {
   return snapshotEntry.md5 !== localEntry.md5;
 }
 
+/**
+ * True when a remote and a local entry already hold byte-identical file content.
+ *
+ * Deliberately stricter than remoteAndLocalEquivalent(): that helper treats any
+ * two folders as equivalent, which is wrong here — a folder pair reaching
+ * promoteConflicts() means competing add/delete changes, not agreement. Requiring
+ * a checksum on both sides also excludes deletions, which never carry one.
+ *
+ * @param {object|null} remoteMeta - Remote entry metadata
+ * @param {object|null} localMeta - Local entry metadata
+ * @returns {boolean} True when both sides hold identical file content
+ */
+function sidesHoldIdenticalContent(remoteMeta, localMeta) {
+  if (!remoteMeta || !localMeta) return false;
+
+  const remoteIsFolder =
+    remoteMeta.isFolder ||
+    remoteMeta.mimeType === "application/vnd.google-apps.folder";
+  if (remoteIsFolder || localMeta.isFolder) return false;
+
+  // Workspace documents have no stable checksum; modifiedTime is all we get,
+  // and equal timestamps do not prove equal content.
+  if (isWorkspaceType(remoteMeta.mimeType || "")) return false;
+
+  return Boolean(remoteMeta.md5Checksum) && remoteMeta.md5Checksum === localMeta.md5;
+}
+
 function promoteConflicts(changes) {
   const remoteByPath = new Map();
   const localByPath = new Map();
@@ -218,18 +245,31 @@ function promoteConflicts(changes) {
   }
 
   const conflictPathSet = new Set();
+  // Both sides can move off the baseline yet land on the same bytes — e.g. the
+  // same file written on two machines, or one side re-downloading what the other
+  // just uploaded. That is agreement, not a conflict: drop the redundant
+  // upload/download instead of asking the user to resolve identical content.
+  const convergedPathSet = new Set();
   for (const pathValue of remoteByPath.keys()) {
-    if (localByPath.has(pathValue)) {
-      conflictPathSet.add(pathValue);
+    if (!localByPath.has(pathValue)) continue;
+
+    const remoteMeta = remoteByPath.get(pathValue).remoteMeta;
+    const localMeta = localByPath.get(pathValue).localMeta;
+    if (sidesHoldIdenticalContent(remoteMeta, localMeta)) {
+      convergedPathSet.add(pathValue);
+      continue;
     }
+
+    conflictPathSet.add(pathValue);
   }
 
-  if (conflictPathSet.size === 0) {
+  if (conflictPathSet.size === 0 && convergedPathSet.size === 0) {
     return changes;
   }
 
   const filtered = changes.filter(
-    (change) => !conflictPathSet.has(change.path)
+    (change) =>
+      !conflictPathSet.has(change.path) && !convergedPathSet.has(change.path)
   );
 
   for (const pathValue of [...conflictPathSet].sort()) {
@@ -1387,6 +1427,35 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
   const localRenameTargets = new Set(
     locallyRenamedFolders.map((rename) => rename.to)
   );
+  /**
+   * True when a locally tracked path has never had a counterpart on Drive.
+   *
+   * saveSnapshot() records every scanned file in localFiles regardless of
+   * whether its upload succeeded, so a file whose upload never happened still
+   * gets a local baseline entry. Its content then matches that baseline
+   * forever, no change is ever emitted, and because `aethel add` can only
+   * stage entries present in the diff, the file becomes impossible to sync.
+   *
+   * A snapshot entry on the remote side means the file DID reach Drive at some
+   * point, so its later absence is a remote deletion to apply locally — never a
+   * reason to re-upload. Only a path Drive has never known is treated as new.
+   */
+  const neverReachedRemote = (relativePath, localMeta) => {
+    if (snapshotRemoteByPath.has(relativePath)) return false;
+
+    const remoteRenameAdjustedPath = applyLocalFolderRenames(
+      relativePath,
+      remotePathRenames
+    );
+    if (snapshotRemoteByPath.has(remoteRenameAdjustedPath)) return false;
+    if (remoteByPath.has(remoteRenameAdjustedPath)) return false;
+    if (localMeta.isFolder && remoteFolderPaths.has(remoteRenameAdjustedPath)) {
+      return false;
+    }
+
+    return true;
+  };
+
   for (const [relativePath, localMeta] of Object.entries(localFilesData)) {
     const remappedLocalPath = remapRenamedLocalPath(relativePath, localPathRenames);
     if (
@@ -1484,6 +1553,20 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
           snapshotMeta: snapshotEntry,
         })
       );
+      continue;
+    }
+
+    // Content matches the local baseline, but the file may never have reached
+    // Drive at all. Surface it as new so it can be staged and uploaded.
+    if (neverReachedRemote(relativePath, localMeta)) {
+      changes.push(
+        createChange({
+          changeType: ChangeType.LOCAL_ADDED,
+          path: relativePath,
+          localMeta,
+          snapshotMeta: snapshotEntry,
+        })
+      );
     }
   }
 
@@ -1512,6 +1595,19 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
       if (remoteAlsoDeleted) {
         continue;
       }
+
+      // Mirror of the never-uploaded case: a path with no snapshot remote record
+      // and nothing at that path on Drive was never synced, so its local removal
+      // has nothing to delete remotely. Reporting it would stage a no-op and
+      // bury the genuine deletions in noise.
+      const neverExistedRemotely =
+        !remoteEntry &&
+        !remoteByPath.has(relativePath) &&
+        !remoteFolderPaths.has(relativePath);
+      if (neverExistedRemotely) {
+        continue;
+      }
+
       changes.push(
         createChange({
           changeType: ChangeType.LOCAL_DELETED,

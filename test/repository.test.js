@@ -846,3 +846,89 @@ test("executeStaged trashes a locally deleted folder that has no tracked Drive I
     cleanup(root);
   }
 });
+
+test("saveSnapshot omits local files that never reached Drive", async () => {
+  const root = makeTmpWorkspace();
+  try {
+    const repo = new Repository(root, { drive: {} });
+
+    const local = {
+      files: {
+        "synced.txt": { localPath: "synced.txt", md5: "synced-md5", size: 3 },
+        "never-uploaded.txt": {
+          localPath: "never-uploaded.txt",
+          md5: "never-md5",
+          size: 5,
+        },
+      },
+      packedDirs: {},
+    };
+    const remoteState = {
+      files: [
+        {
+          id: "synced-id",
+          name: "synced.txt",
+          path: "synced.txt",
+          mimeType: "text/plain",
+          md5Checksum: "synced-md5",
+        },
+      ],
+      duplicateFolders: [],
+    };
+
+    await repo.saveSnapshot("push", { remote: remoteState, local });
+    const snapshot = repo.getSnapshot();
+
+    // Recording the never-uploaded file would make it match its own baseline
+    // forever, so no diff would ever report it again.
+    assert.equal(snapshot.localFiles["never-uploaded.txt"], undefined);
+    assert.equal(snapshot.localFiles["synced.txt"].md5, "synced-md5");
+
+    // It must still be visible as work to do.
+    const diff = computeDiff(snapshot, remoteState.files, local);
+    const change = diff.changes.find((c) => c.path === "never-uploaded.txt");
+    assert.equal(change?.changeType, ChangeType.LOCAL_ADDED);
+    assert.equal(change?.suggestedAction, "upload");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("saveSnapshot keeps local files that are backed by a Drive folder", async () => {
+  const root = makeTmpWorkspace();
+  try {
+    const repo = new Repository(root, { drive: {} });
+
+    const local = {
+      files: {
+        docs: { localPath: "docs", isFolder: true },
+        "docs/guide.md": { localPath: "docs/guide.md", md5: "guide-md5", size: 4 },
+      },
+      packedDirs: {},
+    };
+    const remoteState = {
+      files: [
+        { id: "docs-id", name: "docs", path: "docs", mimeType: FOLDER_MIME, isFolder: true },
+        {
+          id: "guide-id",
+          name: "guide.md",
+          path: "docs/guide.md",
+          mimeType: "text/markdown",
+          md5Checksum: "guide-md5",
+        },
+      ],
+      duplicateFolders: [],
+    };
+
+    await repo.saveSnapshot("push", { remote: remoteState, local });
+    const snapshot = repo.getSnapshot();
+
+    assert.equal(snapshot.localFiles["docs/guide.md"].md5, "guide-md5");
+    assert.ok(snapshot.localFiles["docs"], "a folder backed by Drive is kept");
+
+    const diff = computeDiff(snapshot, remoteState.files, local);
+    assert.deepEqual(diff.changes, []);
+  } finally {
+    cleanup(root);
+  }
+});
