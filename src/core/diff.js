@@ -382,6 +382,11 @@ function promoteRenameDeleteConflicts(
   localFilesData
 ) {
   const remoteById = new Map(remoteFiles.map((file) => [file.id, file]));
+  const remoteByPath = new Map(
+    remoteFiles
+      .filter((file) => file.path)
+      .map((file) => [file.path, file])
+  );
   const conflictChanges = [];
   const handledPaths = new Set();
 
@@ -417,6 +422,20 @@ function promoteRenameDeleteConflicts(
     // tracked file. Do not silently restore either side.
     if (!remoteEntry && matchingLocalPaths.length === 1) {
       const pathValue = matchingLocalPaths[0];
+      const replacementRemote = remoteByPath.get(pathValue) || null;
+
+      // A bulk migration can recreate the same file at the renamed path with
+      // a new Drive ID. The old ID disappearing is then not a competing
+      // deletion: both sides already agree on the destination and bytes.
+      if (
+        replacementRemote &&
+        sidesHoldIdenticalContent(replacementRemote, localFilesData[pathValue])
+      ) {
+        handledPaths.add(sourcePath);
+        handledPaths.add(pathValue);
+        continue;
+      }
+
       handledPaths.add(sourcePath);
       handledPaths.add(pathValue);
       conflictChanges.push(
@@ -424,6 +443,8 @@ function promoteRenameDeleteConflicts(
           changeType: ChangeType.CONFLICT,
           path: pathValue,
           sourcePath,
+          fileId: replacementRemote?.id || null,
+          remoteMeta: replacementRemote,
           localMeta: localFilesData[pathValue],
           snapshotMeta: snapshotEntry,
         })

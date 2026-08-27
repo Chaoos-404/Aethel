@@ -251,6 +251,67 @@ test("computeDiff reports a local file rename and remote deletion as a conflict"
   );
 });
 
+test("computeDiff converges when a renamed file is recreated on Drive with a new ID", () => {
+  const snapshot = {
+    files: {
+      old: {
+        id: "old",
+        path: "old-parent/file.txt",
+        md5Checksum: "same",
+      },
+    },
+    localFiles: {
+      "old-parent/file.txt": { md5: "same" },
+    },
+  };
+  const remoteFiles = [
+    {
+      id: "replacement",
+      path: "new-parent/file.txt",
+      md5Checksum: "same",
+    },
+  ];
+  const localFiles = {
+    "new-parent/file.txt": { md5: "same" },
+  };
+
+  assert.deepEqual(computeDiff(snapshot, remoteFiles, localFiles).changes, []);
+});
+
+test("computeDiff keeps the replacement metadata when recreated Drive content differs", () => {
+  const snapshot = {
+    files: {
+      old: {
+        id: "old",
+        path: "old-parent/file.txt",
+        md5Checksum: "base",
+      },
+    },
+    localFiles: {
+      "old-parent/file.txt": { md5: "base" },
+    },
+  };
+  const remoteFiles = [
+    {
+      id: "replacement",
+      path: "new-parent/file.txt",
+      md5Checksum: "remote-edit",
+    },
+  ];
+  const localFiles = {
+    "new-parent/file.txt": { md5: "base" },
+  };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+
+  assert.equal(diff.conflicts.length, 1);
+  assert.equal(diff.conflicts[0].path, "new-parent/file.txt");
+  assert.equal(diff.conflicts[0].sourcePath, "old-parent/file.txt");
+  assert.equal(diff.conflicts[0].fileId, "replacement");
+  assert.equal(diff.conflicts[0].remoteMeta?.md5Checksum, "remote-edit");
+  assert.equal(diff.conflicts[0].localMeta?.md5, "base");
+});
+
 test("computeDiff reports a remote file rename and local deletion as a conflict", () => {
   const snapshot = {
     files: {

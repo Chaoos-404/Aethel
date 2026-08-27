@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.18 (2026-08-27)
+
+- Reconcile files recreated at renamed Drive paths without false conflicts
+
 ## 1.3.17 (2026-08-27)
 
 - Reconcile interrupted snapshots without false remote changes or unsafe deletions
