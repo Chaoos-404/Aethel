@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.14 (2026-08-27)
+
+- Fix folder rename sync across machines and speed up diff computation
+
 ## 1.3.13 (2026-08-16)
 
 - Preserve local-only files and local modifications during pull
