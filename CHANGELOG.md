@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.17 (2026-08-27)
+
+- Reconcile interrupted snapshots without false remote changes or unsafe deletions
+
 ## 1.3.16 (2026-08-27)
 
 - Stop reporting identical files as conflicts and surface files that never reached Drive
