@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.16 (2026-08-27)
+
+- Stop reporting identical files as conflicts and surface files that never reached Drive
+
 ## 1.3.15 (2026-08-27)
 
 - Delete emptied folders on Drive and reduce sync startup latency
