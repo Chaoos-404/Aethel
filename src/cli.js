@@ -1175,6 +1175,7 @@ async function handlePush(paths, options) {
       ChangeType.LOCAL_ADDED,
       ChangeType.LOCAL_MODIFIED,
       ChangeType.LOCAL_DELETED,
+      ChangeType.LOCAL_RENAMED,
     ].includes(change.changeType)
   );
   let forcedPushConflictChanges = [];

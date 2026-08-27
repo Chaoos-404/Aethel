@@ -5,30 +5,22 @@ import os from "node:os";
 import path from "node:path";
 import { createDefaultIgnoreFile, loadIgnoreRules } from "../src/core/ignore.js";
 
-test("default ignore template covers common Python virtual environment names", async () => {
+test("default ignore template covers Python environment and cache directories", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-default-ignore-"));
 
   try {
     assert.equal(createDefaultIgnoreFile(root), true);
     const rules = loadIgnoreRules(root);
 
-    for (const virtualEnvironment of [
-      ".venv",
-      ".venv-backend",
-      ".venv_backend",
-      "venv",
-      "venv-py313",
-      "venv_py313",
-      "env",
-      "env-local",
-      "env_local",
-      "ENV",
-      "ENV-local",
-      "ENV_local",
-      "uv-cache",
-    ]) {
-      assert.equal(rules.ignores(`apps/api/${virtualEnvironment}`), true);
-      assert.equal(rules.ignores(`apps/api/${virtualEnvironment}/bin/python`), true);
+    for (const directory of [".venv", "__pycache__", "node_modules"]) {
+      assert.equal(rules.ignores(`apps/api/${directory}/`), true);
+      assert.equal(rules.ignores(`apps/api/${directory}/bin/python`), true);
+    }
+
+    // Bare environment names are intentionally not ignored by default —
+    // they are too generic and can shadow real project directories.
+    for (const directory of ["venv", "env", "ENV", "uv-cache"]) {
+      assert.equal(rules.ignores(`apps/api/${directory}/main.py`), false);
     }
   } finally {
     await fs.rm(root, { recursive: true, force: true });

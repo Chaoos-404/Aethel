@@ -697,6 +697,9 @@ function buildRemoteFiles(folders, rawFiles, rootFolderId = null) {
   const isOrphaned = createOrphanChecker(folders, rootFolderId);
   const files = [];
 
+  // Track which folders have children (files or subfolders)
+  const foldersWithChildren = new Set();
+
   for (const file of rawFiles) {
     if (isRemoteMemoItem(file)) continue;
     const parentId = file.parents?.[0] || "";
@@ -707,6 +710,9 @@ function buildRemoteFiles(folders, rawFiles, rootFolderId = null) {
     const parentPath = parentId === rootFolderId ? "" : resolve(parentId);
 
     if (rootFolderId && parentPath === null) continue;
+
+    // Mark parent as having children
+    if (parentId) foldersWithChildren.add(parentId);
 
     files.push({
       id: file.id,
@@ -719,10 +725,17 @@ function buildRemoteFiles(folders, rawFiles, rootFolderId = null) {
     });
   }
 
-  // Include every folder, not only empty ones. Folder IDs are required to
-  // recognize a later rename and preserve its existing subtree during sync.
+  // Mark folders that have subfolders as children
   for (const folder of folders.values()) {
     if (isRemoteMemoItem(folder)) continue;
+    const parentId = folder.parents?.[0] || "";
+    if (parentId) foldersWithChildren.add(parentId);
+  }
+
+  // Include empty folders (no file children AND no subfolder children)
+  for (const folder of folders.values()) {
+    if (isRemoteMemoItem(folder)) continue;
+    if (foldersWithChildren.has(folder.id)) continue;
     if (isOrphaned(folder.id)) continue;
 
     const folderPath = resolve(folder.id);

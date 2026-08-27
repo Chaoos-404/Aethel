@@ -126,23 +126,7 @@ desktop.ini
 
 # Dependencies
 node_modules/
-
-# Python virtual environments
-.venv
-.venv-*
-.venv_*
-venv
-venv-*
-venv_*
-env
-env-*
-env_*
-ENV
-ENV-*
-ENV_*
-
-# Python package/tool caches
-uv-cache
+.venv/
 __pycache__/
 
 # Build output

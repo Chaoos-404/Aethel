@@ -368,12 +368,44 @@ function localMoveDestinationBeforeAncestorMoves(entry, localMoves) {
   return destinationPath;
 }
 
-async function renameRemoteFolder(drive, entry) {
+async function renameRemoteFolder(drive, entry, driveFolderId) {
+  let fileId = entry.fileId;
+
+  // Non-empty folders carry no ID through the remote listing; resolve the
+  // folder by its current (pre-rename) remote path instead.
+  if (!fileId) {
+    const remoteItem = await findRemoteItemByPath(
+      drive,
+      entry.sourcePath || entry.remotePath || entry.path,
+      driveFolderId
+    );
+    fileId = remoteItem?.id || null;
+  }
+
+  if (!fileId) {
+    throw new Error(
+      `Remote folder not found for rename: ${entry.sourcePath || entry.path}`
+    );
+  }
+
   await drive.files.update({
-    fileId: entry.fileId,
+    fileId,
     requestBody: { name: path.posix.basename(entry.remotePath || entry.path) },
     fields: "id,name",
   });
+}
+
+function remapPathAfterRename(pathValue, fromPath, toPath) {
+  if (!pathValue || !fromPath || !toPath || fromPath === toPath) {
+    return pathValue;
+  }
+  if (pathValue === fromPath) {
+    return toPath;
+  }
+  if (pathValue.startsWith(`${fromPath}/`)) {
+    return `${toPath}${pathValue.slice(fromPath.length)}`;
+  }
+  return pathValue;
 }
 
 async function cleanupEmptyParentDirectories(root, relativePath) {
@@ -515,13 +547,37 @@ export async function executeStaged(drive, root, progress) {
   }
 
   // Rename existing Drive folders before uploads into their new local paths.
+  // Deepest first, matching how nested local moves are ordered.
+  remoteRenames.sort(
+    (left, right) =>
+      (right.entry.sourcePath || right.entry.path).split("/").length -
+      (left.entry.sourcePath || left.entry.path).split("/").length
+  );
   for (const { entry } of remoteRenames) {
     try {
-      await renameRemoteFolder(drive, entry);
+      await renameRemoteFolder(drive, entry, driveFolderId);
       result.foldersRenamed++;
     } catch (err) {
       failedPaths.add(entry.path);
       result.errors.push(`rename_remote ${entry.path}: ${err.message}`);
+    }
+  }
+
+  // A successful remote rename moved every remote descendant with it — remap
+  // pending remote targets so uploads land in the renamed folder instead of
+  // recreating the old one.
+  for (const { entry: rename } of remoteRenames) {
+    if (failedPaths.has(rename.path) || !rename.sourcePath) continue;
+    const renameTargetPath = rename.remotePath || rename.path;
+    for (const { entry } of remoteOps) {
+      const remapped = remapPathAfterRename(
+        entry.remotePath || entry.path,
+        rename.sourcePath,
+        renameTargetPath
+      );
+      if (remapped !== (entry.remotePath || entry.path)) {
+        entry.remotePath = remapped;
+      }
     }
   }
 
@@ -545,6 +601,26 @@ export async function executeStaged(drive, root, progress) {
     } catch (err) {
       failedPaths.add(entry.path);
       result.errors.push(`move_local ${entry.path}: ${err.message}`);
+    }
+  }
+
+  // A successful move relocated every local descendant with it — remap
+  // pending local paths so later uploads and deletes find their files at the
+  // moved location instead of treating them as missing (which would trash
+  // the remote copy). Applied in executed (deepest-source-first) order so
+  // nested moves compose to each entry's final path.
+  for (const { entry: move } of localMoves) {
+    if (failedPaths.has(move.path) || !move.sourcePath) continue;
+    const moveDestination = move.localPath || move.path;
+    for (const { entry } of [...remoteOps, ...localDeletes]) {
+      const remapped = remapPathAfterRename(
+        entry.localPath || entry.path,
+        move.sourcePath,
+        moveDestination
+      );
+      if (remapped !== (entry.localPath || entry.path)) {
+        entry.localPath = remapped;
+      }
     }
   }
 

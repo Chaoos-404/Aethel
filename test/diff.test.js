@@ -998,3 +998,201 @@ test("computeDiff ignores historical snapshot entries that now match .aetheligno
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ── Folder rename + concurrent edits (two-machine scenarios) ─────────
+
+test("computeDiff keeps a local edit uploadable through a pulled remote folder rename", () => {
+  // Machine 1 renamed docs/ -> archive/ on Drive; machine 2 edited a file
+  // inside docs/ locally. The rename must become one local move, and the
+  // edit must stay staged as an upload that targets the file's NEW remote
+  // location — not the stale pre-rename path.
+  const snapshot = {
+    files: {
+      child: { id: "child", path: "docs/notes.md", localPath: "docs/notes.md", md5Checksum: "base" },
+    },
+    localFiles: {
+      "docs/notes.md": { localPath: "docs/notes.md", md5: "base" },
+    },
+  };
+  const remoteFiles = [
+    { id: "child", path: "archive/notes.md", md5Checksum: "base" },
+  ];
+  const localFiles = {
+    docs: { localPath: "docs", isFolder: true },
+    "docs/notes.md": { localPath: "docs/notes.md", md5: "edited" },
+  };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+
+  assert.deepEqual(
+    diff.changes.map(({ changeType, path, sourcePath }) => ({ changeType, path, sourcePath })),
+    [
+      { changeType: ChangeType.REMOTE_RENAMED, path: "archive", sourcePath: "docs" },
+      { changeType: ChangeType.LOCAL_MODIFIED, path: "docs/notes.md", sourcePath: undefined },
+    ]
+  );
+  assert.equal(diff.conflicts.length, 0);
+
+  const upload = diff.changes.find((change) => change.changeType === ChangeType.LOCAL_MODIFIED);
+  assert.equal(upload.fileId, "child");
+  assert.equal(upload.remoteMeta?.path, "archive/notes.md");
+});
+
+test("computeDiff detects a local rename of a non-empty folder without folder IDs", () => {
+  // Non-empty folders are absent from remote listings and snapshots; the
+  // rename must still be recognized from the implicit baseline folder and
+  // pushed as a remote rename (ID resolved at execution time).
+  const snapshot = {
+    files: {
+      child: { id: "child", path: "docs/notes.md", localPath: "docs/notes.md", md5Checksum: "same" },
+    },
+    localFiles: {
+      "docs/notes.md": { localPath: "docs/notes.md", md5: "same" },
+    },
+  };
+  const remoteFiles = [
+    { id: "child", path: "docs/notes.md", md5Checksum: "same" },
+  ];
+  const localFiles = {
+    archive: { localPath: "archive", isFolder: true },
+    "archive/notes.md": { localPath: "archive/notes.md", md5: "same" },
+  };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+
+  assert.deepEqual(
+    diff.changes.map(({ changeType, path, sourcePath }) => ({ changeType, path, sourcePath })),
+    [{ changeType: ChangeType.LOCAL_RENAMED, path: "archive", sourcePath: "docs" }]
+  );
+  assert.equal(diff.changes[0].suggestedAction, "rename_remote");
+});
+
+test("computeDiff keeps a local rename detected when some files inside were also edited", () => {
+  const snapshot = {
+    files: {
+      a: { id: "a", path: "docs/kept.md", localPath: "docs/kept.md", md5Checksum: "same" },
+      b: { id: "b", path: "docs/edited.md", localPath: "docs/edited.md", md5Checksum: "base" },
+    },
+    localFiles: {
+      "docs/kept.md": { localPath: "docs/kept.md", md5: "same" },
+      "docs/edited.md": { localPath: "docs/edited.md", md5: "base" },
+    },
+  };
+  const remoteFiles = [
+    { id: "a", path: "docs/kept.md", md5Checksum: "same" },
+    { id: "b", path: "docs/edited.md", md5Checksum: "base" },
+  ];
+  const localFiles = {
+    archive: { localPath: "archive", isFolder: true },
+    "archive/kept.md": { localPath: "archive/kept.md", md5: "same" },
+    "archive/edited.md": { localPath: "archive/edited.md", md5: "edited" },
+  };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+
+  assert.deepEqual(
+    diff.changes.map(({ changeType, path, sourcePath }) => ({ changeType, path, sourcePath })),
+    [
+      { changeType: ChangeType.LOCAL_RENAMED, path: "archive", sourcePath: "docs" },
+      { changeType: ChangeType.LOCAL_MODIFIED, path: "archive/edited.md", sourcePath: undefined },
+    ]
+  );
+  assert.equal(diff.conflicts.length, 0);
+
+  const upload = diff.changes.find((change) => change.changeType === ChangeType.LOCAL_MODIFIED);
+  assert.equal(upload.fileId, "b");
+  // The upload still targets the file's current remote location (pre-rename);
+  // the executor remaps it after the staged remote rename runs.
+  assert.equal(upload.remoteMeta?.path, "docs/edited.md");
+});
+
+test("computeDiff downloads a remote edit into the locally renamed folder", () => {
+  // Machine 2 renamed docs/ -> archive/ locally; machine 1 edited a file on
+  // Drive. The download must land inside the renamed local tree instead of
+  // recreating the old docs/ directory.
+  const snapshot = {
+    files: {
+      child: { id: "child", path: "docs/notes.md", localPath: "docs/notes.md", md5Checksum: "base" },
+    },
+    localFiles: {
+      "docs/notes.md": { localPath: "docs/notes.md", md5: "base" },
+    },
+  };
+  const remoteFiles = [
+    { id: "child", path: "docs/notes.md", md5Checksum: "remote-edit" },
+  ];
+  const localFiles = {
+    archive: { localPath: "archive", isFolder: true },
+    "archive/notes.md": { localPath: "archive/notes.md", md5: "base" },
+  };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+
+  assert.deepEqual(
+    diff.changes.map(({ changeType, path, sourcePath }) => ({ changeType, path, sourcePath })),
+    [
+      { changeType: ChangeType.LOCAL_RENAMED, path: "archive", sourcePath: "docs" },
+      { changeType: ChangeType.REMOTE_MODIFIED, path: "docs/notes.md", sourcePath: undefined },
+    ]
+  );
+  assert.equal(diff.conflicts.length, 0);
+
+  const download = diff.changes.find((change) => change.changeType === ChangeType.REMOTE_MODIFIED);
+  assert.equal(download.localMeta?.localPath, "archive/notes.md");
+});
+
+test("computeDiff promotes a moved-and-modified file edited on both sides to one conflict", () => {
+  // Machine 1 renamed the folder AND edited the file; machine 2 edited the
+  // same file. Staging a download and an upload for the same Drive file
+  // would race — this must surface as a single conflict instead.
+  const snapshot = {
+    files: {
+      child: { id: "child", path: "docs/notes.md", localPath: "docs/notes.md", md5Checksum: "base" },
+    },
+    localFiles: {
+      "docs/notes.md": { localPath: "docs/notes.md", md5: "base" },
+    },
+  };
+  const remoteFiles = [
+    { id: "child", path: "archive/notes.md", md5Checksum: "remote-edit" },
+  ];
+  const localFiles = {
+    docs: { localPath: "docs", isFolder: true },
+    "docs/notes.md": { localPath: "docs/notes.md", md5: "local-edit" },
+  };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+
+  assert.deepEqual(
+    diff.changes.map(({ changeType, path }) => ({ changeType, path })),
+    [
+      { changeType: ChangeType.REMOTE_RENAMED, path: "archive" },
+      { changeType: ChangeType.CONFLICT, path: "docs/notes.md" },
+    ]
+  );
+
+  const conflict = diff.conflicts[0];
+  assert.equal(conflict.fileId, "child");
+  assert.equal(conflict.remoteMeta?.path, "archive/notes.md");
+  assert.equal(conflict.localMeta?.md5, "local-edit");
+});
+
+test("computeDiff stays quiet when both sides renamed a non-empty folder identically", () => {
+  const snapshot = {
+    files: {
+      child: { id: "child", path: "docs/notes.md", localPath: "docs/notes.md", md5Checksum: "same" },
+    },
+    localFiles: {
+      "docs/notes.md": { localPath: "docs/notes.md", md5: "same" },
+    },
+  };
+  const remoteFiles = [
+    { id: "child", path: "archive/notes.md", md5Checksum: "same" },
+  ];
+  const localFiles = {
+    archive: { localPath: "archive", isFolder: true },
+    "archive/notes.md": { localPath: "archive/notes.md", md5: "same" },
+  };
+
+  assert.deepEqual(computeDiff(snapshot, remoteFiles, localFiles).changes, []);
+});

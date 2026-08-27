@@ -478,7 +478,7 @@ test("getRemoteState walks only the configured Drive folder tree", async () => {
 
   assert.deepEqual(
     remoteState.files.map((item) => item.path).sort(),
-    ["docs", "docs/inside.txt", "empty", "root-child.txt"]
+    ["docs/inside.txt", "empty", "root-child.txt"]
   );
   assert.equal(
     drive.listQueries().some((query) => query === "trashed = false"),
@@ -504,7 +504,7 @@ test("getRemoteState uses global fetch for large configured folder snapshots", a
     estimatedRemoteFiles: 50_000,
   });
 
-  assert.deepEqual(remoteState.files.map((item) => item.path).sort(), ["docs", "docs/inside.txt"]);
+  assert.deepEqual(remoteState.files.map((item) => item.path), ["docs/inside.txt"]);
   assert.equal(
     drive.listQueries().some((query) => query === "trashed = false"),
     true
@@ -681,43 +681,6 @@ test("executeStaged downloads staged files without an extra metadata request", a
     assert.equal(metadataGets, 0);
     assert.equal(mediaGets, 1);
     assert.equal(await fs.readFile(path.join(workspaceRoot, "fast.txt"), "utf8"), "downloaded content");
-  } finally {
-    await fs.rm(workspaceRoot, { recursive: true, force: true });
-  }
-});
-
-test("executeStaged renames an existing remote folder without transferring its children", async () => {
-  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-folder-rename-"));
-
-  try {
-    initWorkspace(workspaceRoot, null, "My Drive");
-    writeIndex(workspaceRoot, {
-      staged: [{
-        action: "rename_remote",
-        path: "new-name",
-        localPath: "new-name",
-        sourcePath: "old-name",
-        fileId: "folder-1",
-        isFolder: true,
-      }],
-    });
-    const updates = [];
-    const result = await executeStaged({
-      files: {
-        async update(params) {
-          updates.push(params);
-          return { data: { id: params.fileId, name: params.requestBody.name } };
-        },
-      },
-    }, workspaceRoot);
-
-    assert.equal(result.foldersRenamed, 1);
-    assert.equal(result.errors.length, 0);
-    assert.deepEqual(updates, [{
-      fileId: "folder-1",
-      requestBody: { name: "new-name" },
-      fields: "id,name",
-    }]);
   } finally {
     await fs.rm(workspaceRoot, { recursive: true, force: true });
   }
@@ -1315,4 +1278,121 @@ test("listIgnoredRemoteItems returns topmost ignored Drive items", async () => {
       { id: "log-file", path: "logs/debug.log", isFolder: false },
     ]
   );
+});
+
+test("executeStaged uploads a local edit after its folder was moved by a staged rename", async () => {
+  // Machine 1 renamed docs/ -> archive/ on Drive; machine 2 edited a file in
+  // docs/ and staged both the pulled move and the upload. The move runs
+  // first, so the upload must follow the file to its moved local path —
+  // previously it hit ENOENT and trashed the remote file.
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-move-upload-"));
+
+  try {
+    initWorkspace(workspaceRoot, null, "My Drive");
+    await fs.mkdir(path.join(workspaceRoot, "docs"), { recursive: true });
+    await fs.writeFile(path.join(workspaceRoot, "docs", "notes.md"), "edited");
+
+    writeIndex(workspaceRoot, {
+      staged: [
+        {
+          action: "move_local",
+          path: "archive",
+          localPath: "archive",
+          sourcePath: "docs",
+          isFolder: true,
+        },
+        {
+          action: "upload",
+          path: "docs/notes.md",
+          localPath: "docs/notes.md",
+          fileId: "file-1",
+          remotePath: "archive/notes.md",
+        },
+      ],
+    });
+
+    const drive = createFakeDrive([
+      folder("folder-1", "archive", "root", "2026-04-04T10:00:00.000Z"),
+      file("file-1", "notes.md", "folder-1", "2026-04-04T10:00:01.000Z", "old-md5"),
+    ]);
+
+    const result = await executeStaged(drive, workspaceRoot);
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.uploaded, 1);
+    assert.equal(result.deletedRemote, 0);
+
+    const remoteFile = drive.snapshot().find((item) => item.id === "file-1");
+    assert.equal(remoteFile.trashed, false);
+    assert.equal(remoteFile._body, "edited");
+
+    assert.equal(
+      await fs.readFile(path.join(workspaceRoot, "archive", "notes.md"), "utf8"),
+      "edited"
+    );
+    assert.equal(
+      drive.snapshot().some((item) => item.name === "docs" && !item.trashed),
+      false
+    );
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("executeStaged renames a remote folder without a fileId and remaps staged uploads", async () => {
+  // Machine 2 renamed docs/ -> archive/ locally and edited a file inside.
+  // Non-empty folders carry no ID through the remote listing, so the staged
+  // rename resolves the folder by path; the upload staged against the old
+  // remote path must land in the renamed folder, not recreate docs/.
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-rename-upload-"));
+
+  try {
+    initWorkspace(workspaceRoot, null, "My Drive");
+    await fs.mkdir(path.join(workspaceRoot, "archive"), { recursive: true });
+    await fs.writeFile(path.join(workspaceRoot, "archive", "notes.md"), "edited");
+
+    writeIndex(workspaceRoot, {
+      staged: [
+        {
+          action: "rename_remote",
+          path: "archive",
+          localPath: "archive",
+          sourcePath: "docs",
+          isFolder: true,
+        },
+        {
+          action: "upload",
+          path: "archive/notes.md",
+          localPath: "archive/notes.md",
+          fileId: "file-1",
+          remotePath: "docs/notes.md",
+        },
+      ],
+    });
+
+    const drive = createFakeDrive([
+      folder("folder-1", "docs", "root", "2026-04-04T10:00:00.000Z"),
+      file("file-1", "notes.md", "folder-1", "2026-04-04T10:00:01.000Z", "old-md5"),
+    ]);
+
+    const result = await executeStaged(drive, workspaceRoot);
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.foldersRenamed, 1);
+    assert.equal(result.uploaded, 1);
+
+    const remoteFolder = drive.snapshot().find((item) => item.id === "folder-1");
+    assert.equal(remoteFolder.name, "archive");
+
+    const remoteFile = drive.snapshot().find((item) => item.id === "file-1");
+    assert.equal(remoteFile._body, "edited");
+    assert.deepEqual(remoteFile.parents, ["folder-1"]);
+
+    assert.equal(
+      drive.snapshot().some((item) => item.name === "docs" && !item.trashed),
+      false
+    );
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
 });

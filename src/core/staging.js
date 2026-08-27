@@ -170,6 +170,10 @@ export function conflictResolutionChange(change, strategy) {
   if (strategy === "theirs") {
     return {
       ...change,
+      fileId: change.fileId || change.remoteMeta?.id,
+      remotePath: change.remoteMeta?.path || change.path,
+      remoteMimeType: change.remoteMeta?.mimeType,
+      remoteMd5Checksum: change.remoteMeta?.md5Checksum,
       changeType: "remote_modified",
       suggestedAction: "download",
       shortStatus: "MR",
@@ -229,8 +233,10 @@ export function stageConflictResolution(root, change, strategy) {
       action: "download",
       path: remoteCopyPath,
       localPath: remoteCopyPath,
-      fileId: change.fileId,
+      fileId: change.fileId || change.remoteMeta?.id,
       remotePath: change.remoteMeta?.path || change.path,
+      remoteMimeType: change.remoteMeta?.mimeType,
+      remoteMd5Checksum: change.remoteMeta?.md5Checksum,
     });
 
     // Stage upload of local version
@@ -238,7 +244,7 @@ export function stageConflictResolution(root, change, strategy) {
       action: "upload",
       path: change.path,
       localPath: change.localMeta?.localPath || change.path,
-      fileId: change.fileId,
+      fileId: change.fileId || change.remoteMeta?.id,
       remotePath: change.remoteMeta?.path || change.path,
       ...(change.localMeta?.md5 ? { localMd5: change.localMeta.md5 } : {}),
       ...(Number.isFinite(change.localMeta?.size) ? { localSize: change.localMeta.size } : {}),

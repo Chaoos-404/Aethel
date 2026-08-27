@@ -121,10 +121,33 @@ function buildPulledLocalSnapshot(previousSnapshot, scannedLocal, remoteFiles, p
     }
 
     if (action === "move_local") {
+      // Carry the previous baseline across the move by remapping its keys.
+      // Adopting the post-move scan instead would record a locally-edited
+      // file's current hash as "synced" and silently swallow its pending
+      // upload on the next push.
       if (change.sourcePath) {
-        removePathAndDescendants(files, change.sourcePath);
+        const movedEntries = {};
+        for (const [candidate, entry] of Object.entries(files)) {
+          if (!isPathOrDescendant(candidate, change.sourcePath)) continue;
+          const movedPath = `${pathValue}${candidate.slice(change.sourcePath.length)}`;
+          movedEntries[movedPath] = entry.localPath
+            ? { ...entry, localPath: movedPath }
+            : entry;
+          delete files[candidate];
+        }
+        Object.assign(files, movedEntries);
       }
-      addPulledRemotePaths(files, scannedLocalFiles, remoteFiles, pathValue);
+      // Fill only the gaps (paths with no carried baseline) from the scan.
+      for (const remoteFile of remoteFiles) {
+        if (!remoteFile.path || !isPathOrDescendant(remoteFile.path, pathValue)) {
+          continue;
+        }
+        if (files[remoteFile.path]) continue;
+        const localEntry = scannedLocalFiles[remoteFile.path];
+        if (localEntry) {
+          files[remoteFile.path] = localEntry;
+        }
+      }
       continue;
     }
 

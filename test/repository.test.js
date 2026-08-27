@@ -652,3 +652,71 @@ test("Repository with null root can be constructed", () => {
   assert.equal(repo.root, null);
   assert.equal(repo.isConnected, false);
 });
+
+test("pull snapshots keep a local edit pending across a remote folder rename", async () => {
+  const root = makeTmpWorkspace();
+  try {
+    const repo = new Repository(root);
+    fs.mkdirSync(path.join(root, "docs"));
+    fs.writeFileSync(path.join(root, "docs", "notes.md"), "base");
+    const baselineLocal = await repo.scanLocal();
+    const baseMd5 = baselineLocal.files["docs/notes.md"].md5;
+    writeSnapshot(root, {
+      timestamp: "2026-08-16T00:00:00.000Z",
+      message: "baseline",
+      files: {
+        child: {
+          id: "child",
+          path: "docs/notes.md",
+          localPath: "docs/notes.md",
+          md5Checksum: baseMd5,
+        },
+      },
+      localFiles: baselineLocal.files,
+    });
+
+    // Machine 2 edits the file; machine 1 renamed docs/ -> archive/ on Drive.
+    fs.writeFileSync(path.join(root, "docs", "notes.md"), "local edit");
+    const remoteState = {
+      files: [
+        {
+          id: "child",
+          name: "notes.md",
+          path: "archive/notes.md",
+          mimeType: "text/plain",
+          md5Checksum: baseMd5,
+        },
+      ],
+      duplicateFolders: [],
+    };
+
+    // The pull's move_local has already relocated the tree by snapshot time.
+    fs.renameSync(path.join(root, "docs"), path.join(root, "archive"));
+
+    await repo.saveSnapshot("pull", {
+      remote: remoteState,
+      pullChanges: [
+        {
+          suggestedAction: "move_local",
+          path: "archive",
+          sourcePath: "docs",
+        },
+      ],
+    });
+
+    // The carried baseline must keep the PRE-edit hash — recording the edited
+    // hash as synced would silently swallow the pending upload.
+    const snapshot = repo.getSnapshot();
+    assert.equal(snapshot.localFiles["archive/notes.md"].md5, baseMd5);
+    assert.equal(snapshot.localFiles["docs/notes.md"], undefined);
+
+    const diff = computeDiff(snapshot, remoteState.files, await repo.scanLocal());
+    assert.deepEqual(
+      diff.changes.map((change) => ({ type: change.changeType, path: change.path })),
+      [{ type: ChangeType.LOCAL_MODIFIED, path: "archive/notes.md" }]
+    );
+    assert.equal(diff.changes[0].fileId, "child");
+  } finally {
+    cleanup(root);
+  }
+});
