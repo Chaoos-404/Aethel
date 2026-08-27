@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.15 (2026-08-27)
+
+- Delete emptied folders on Drive and reduce sync startup latency
+
 ## 1.3.14 (2026-08-27)
 
 - Fix folder rename sync across machines and speed up diff computation
