@@ -345,7 +345,21 @@ async function moveLocalFolder(entry, root) {
   const source = toLocalAbsolutePath(root, sourcePath);
   const destination = toLocalAbsolutePath(root, entry.localPath || entry.path);
   await fs.promises.mkdir(path.dirname(destination), { recursive: true });
-  await fs.promises.rename(source, destination);
+  await renameWithRetry(source, destination);
+}
+
+// Windows can transiently refuse directory renames (EPERM/EBUSY/EACCES) while
+// another process or a just-closed handle still references the tree.
+async function renameWithRetry(source, destination, attempts = 6) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fs.promises.rename(source, destination);
+    } catch (err) {
+      const transient = ["EPERM", "EBUSY", "EACCES"].includes(err.code);
+      if (!transient || attempt >= attempts || process.platform !== "win32") throw err;
+      await new Promise(resolve => setTimeout(resolve, 50 * attempt));
+    }
+  }
 }
 
 function localMoveDestinationBeforeAncestorMoves(entry, localMoves) {
