@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.21 (2026-10-02)
+
+- Add a new landing page with a live terminal demo; replace the demo GIFs and video in the README and package
+
 ## 1.3.20 (2026-10-02)
 
 - Make getDriveAgent tests independent of proxy environment variables
