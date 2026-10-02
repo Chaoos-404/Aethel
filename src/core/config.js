@@ -7,6 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
 import { createManifest } from "./pack-manifest.js";
+import { assertWorkspaceWritable } from "./workspace-lock.js";
 
 export const AETHEL_DIR = ".aethel";
 export const CONFIG_FILE = "config.json";
@@ -16,6 +17,22 @@ export const HISTORY_DIR = "history";
 export const LATEST_SNAPSHOT = "latest.json";
 export const PACK_MANIFEST_FILE = "pack-manifest.json";
 export const PACK_CONFIG_FILE = ".aethelconfig";
+
+/** Durable replacement prevents interrupted writes from truncating state. */
+export function atomicWrite(filename, text) {
+  const temporary = `${filename}.${crypto.randomUUID()}.tmp`;
+  let fd;
+  try {
+    fd = fs.openSync(temporary, "wx", 0o600);
+    fs.writeFileSync(fd, text);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd); fd = undefined;
+    fs.renameSync(temporary, filename);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    fs.rmSync(temporary, { force: true });
+  }
+}
 
 /** Walk up from `start` looking for a .aethel/ directory. */
 export function findRoot(start = process.cwd()) {
@@ -75,7 +92,7 @@ export function readConfig(root) {
 }
 
 export function writeConfig(root, data) {
-  fs.writeFileSync(
+  atomicWrite(
     path.join(dot(root), CONFIG_FILE),
     JSON.stringify(data, null, 2) + "\n"
   );
@@ -90,7 +107,8 @@ export function readIndex(root) {
 }
 
 export function writeIndex(root, data) {
-  fs.writeFileSync(
+  assertWorkspaceWritable(root);
+  atomicWrite(
     path.join(dot(root), INDEX_FILE),
     JSON.stringify(data, null, 2) + "\n"
   );
@@ -137,7 +155,7 @@ export function writeSnapshot(root, snapshot) {
   }
 
   // Compact JSON — snapshots can be large, pretty-printing is slow + wastes disk
-  fs.writeFileSync(latest, JSON.stringify(snapshot) + "\n");
+  atomicWrite(latest, JSON.stringify(snapshot) + "\n");
 }
 
 // ── pack config helpers ───────────────────────────────────────────────

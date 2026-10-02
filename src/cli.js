@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import {
   initWorkspace,
+  findRoot,
   readConfig,
   requireRoot,
 } from "./core/config.js";
@@ -15,6 +16,7 @@ import { createDefaultIgnoreFile, loadIgnoreRules } from "./core/ignore.js";
 import { createProgressBar, createSpinner } from "./core/progress.js";
 import { summarizeChanges, summarizeStagedEntries } from "./core/change-summary.js";
 import { remoteCacheEnabledByDefault } from "./core/sync-cache-policy.js";
+import { logEvent, withRunLog } from "./core/logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf-8"));
@@ -166,6 +168,7 @@ function printChangePreview({ label, changes, debug, dryRunLimit }) {
 
 function addAuthOptions(command) {
   return command
+    .option("--non-interactive", "Fail instead of opening browser authentication")
     .option("--credentials <path>", "Path to OAuth client credentials JSON")
     .option("--token <path>", "Path to cached OAuth token JSON");
 }
@@ -176,6 +179,7 @@ async function openRepo(options, { requireWorkspace = true, silent = false, conn
     credentials: options.credentials,
     token: options.token,
     forceAuth: options.forceAuth,
+    nonInteractive: options.nonInteractive,
   });
   if (!connect) {
     return repo;
@@ -434,7 +438,6 @@ async function handleClone(remote, directory, options) {
   console.log(`Staged ${count} remote item(s). Checking out files...`);
   await handleCommit({ ...options, message: options.message || "clone" }, {
     repo,
-    snapshotHint: { remote: remoteState },
   });
 }
 
@@ -696,12 +699,10 @@ async function handleInit(options) {
 }
 
 async function handleStatus(options) {
-  // `status` is read-only and usually served straight from the remote cache,
-  // so let Repository authenticate lazily — only if it actually has to fetch.
+  // Refresh remote observations so changes from other devices remain visible.
   const repo = await openRepo(options, { connect: false });
   const { diff } = await loadStateWithProgress(repo, {
     useCache: remoteCacheEnabledByDefault("status"),
-    remoteCacheTtlMs: Number.POSITIVE_INFINITY,
   });
   const staged = repo.getStagedEntries();
 
@@ -898,11 +899,11 @@ async function handleReset(paths, options) {
   }
 }
 
-async function handleCommit(options, { repo: existingRepo, snapshotHint } = {}) {
+async function handleCommit(options, { repo: existingRepo } = {}) {
   const repo = existingRepo || await openRepo(options);
   const staged = repo.getStagedEntries();
 
-  if (!staged.length) {
+  if (!staged.length && !fs.existsSync(path.join(repo.root, ".aethel", "execution.jsonl"))) {
     console.log("Nothing staged. Use 'aethel add' first.");
     return;
   }
@@ -910,29 +911,21 @@ async function handleCommit(options, { repo: existingRepo, snapshotHint } = {}) 
   const message = options.message || "sync";
   const bar = createProgressBar(`Syncing ${staged.length} change(s)`, staged.length);
 
-  const result = await repo.executeStaged((done) => {
-    bar.update(done + 1);
-  });
-
-  bar.done(`Commit complete: ${result.summary}`);
+  let result;
+  try {
+    result = await repo.commitStaged({ message, progress: done => bar.update(done + 1) });
+  } catch (error) {
+    bar.done("Commit interrupted; recovery records retained.");
+    throw error;
+  }
+  bar.done(`${result.errors.length ? "Commit incomplete" : "Commit complete"}: ${result.summary}`);
+  if (result.baselineSaved) console.log("Snapshot saved for completed operations.");
   if (result.errors.length) {
-    for (const error of result.errors) {
-      console.log(`  ERROR: ${error}`);
-    }
-    console.log("Snapshot not saved because some staged changes failed.");
-    return;
+    for (const error of result.errors) console.log(`  ERROR: ${error}`);
+    console.log("Failed operations remain staged for retry.");
+    process.exitCode = 3;
   }
 
-  const snapshotStart = Date.now();
-  const spinner = createSpinner("Saving snapshot...");
-  // snapshotHint lets callers (pull/push) pass pre-loaded state
-  // so saveSnapshot skips redundant API calls / fs scans.
-  await repo.saveSnapshot(message, snapshotHint);
-  const skipped = [];
-  if (snapshotHint?.remote) skipped.push("remote reused");
-  if (snapshotHint?.local) skipped.push("local reused");
-  const hint = skipped.length ? ` (${skipped.join(", ")})` : "";
-  spinner.succeed(`Snapshot saved in ${fmtMs(Date.now() - snapshotStart)}${hint}`);
 }
 
 async function handleLog(options) {
@@ -1028,6 +1021,7 @@ async function handlePull(paths, options) {
   const { diff, remoteState } = await loadStateWithProgress(repo, {
     useCache: remoteCacheEnabledByDefault("pull"),
   });
+  if (options.nonInteractive && diff.conflicts.length && !options.force) process.exitCode = 2;
   debug("pull state loaded", {
     changes: diff.changes.length,
     conflicts: diff.conflicts.length,
@@ -1043,6 +1037,13 @@ async function handlePull(paths, options) {
       (change) => change.changeType === ChangeType.REMOTE_RENAMED
     );
 
+    if (options.nonInteractive && !options.force && diff.conflicts.length) {
+      const blocked = candidate => diff.conflicts.some(conflict =>
+        candidate === conflict.path || candidate.startsWith(`${conflict.path}/`) || conflict.path.startsWith(`${candidate}/`));
+      remoteFiles = remoteFiles.filter(file => !blocked(file.path));
+      remoteDeletions = remoteDeletions.filter(change => !blocked(change.path));
+      remoteRenames = remoteRenames.filter(change => !blocked(change.path) && !blocked(change.sourcePath || change.path));
+    }
     if (paths && paths.length > 0) {
       remoteFiles = remoteFiles.filter((file) =>
         paths.some((p) => matchesPattern(file.path, p))
@@ -1082,18 +1083,7 @@ async function handlePull(paths, options) {
     console.log(`Staged ${count} remote change(s). Committing...`);
     await handleCommit({ ...options, message: options.message || "pull" }, {
       repo,
-      snapshotHint: {
-        remote: remoteState,
-        pullChanges: [
-          ...remoteFiles.map((remoteFile) => ({
-            suggestedAction: "download",
-            path: remoteFile.path,
-            remoteMeta: remoteFile,
-          })),
-          ...remoteDeletions,
-          ...remoteRenames,
-        ],
-      },
+
     });
     return;
   }
@@ -1163,10 +1153,8 @@ async function handlePull(paths, options) {
   const count = repo.stageChanges(remoteChanges);
   debug("pull staging done", { staged: count });
   console.log(`Staged ${count} remote change(s). Committing...`);
-  // Pull downloads remote→local: remote state unchanged, only re-scan local
   await handleCommit({ ...options, message: options.message || "pull" }, {
     repo,
-    snapshotHint: { remote: remoteState, pullChanges: remoteChanges },
   });
 }
 
@@ -1183,6 +1171,7 @@ async function handlePush(paths, options) {
   const { diff, local } = await loadStateWithProgress(repo, {
     useCache: remoteCacheEnabledByDefault("push"),
   });
+  if (options.nonInteractive && diff.conflicts.length && !options.force) process.exitCode = 2;
   debug("push state loaded", {
     changes: diff.changes.length,
     conflicts: diff.conflicts.length,
@@ -1269,10 +1258,8 @@ async function handlePush(paths, options) {
   const count = repo.stageChanges(localChanges);
   debug("push staging done", { staged: count });
   console.log(`Staged ${count} local change(s). Committing...`);
-  // Push uploads local→remote: local state unchanged, only re-fetch remote
   await handleCommit({ ...options, message: options.message || "push" }, {
     repo,
-    snapshotHint: { local },
   });
 }
 
@@ -2104,7 +2091,18 @@ async function main() {
       .option("--shared-drives", "Include shared drives")
   ).action(handleTui);
 
-  await program.parseAsync(process.argv);
+  program.hook("preAction", (_command, actionCommand) => {
+    logEvent("info", "command.started", { command: actionCommand.name() });
+  });
+  program.exitOverride();
+  await withRunLog(findRoot(), "cli", async () => {
+    try {
+      await program.parseAsync(process.argv);
+    } catch (error) {
+      if (error.code?.startsWith("commander.") && error.exitCode === 0) return;
+      throw error;
+    }
+  });
 }
 
 main().catch((error) => {

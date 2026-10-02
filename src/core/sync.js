@@ -10,6 +10,9 @@ import {
 } from "./drive-api.js";
 import { pullPack, pushPack } from "./pack-sync.js";
 import { md5Local } from "./snapshot.js";
+import { logEvent, withRunLog } from "./logger.js";
+import { openExecutionJournal, operationKey } from "./execution-journal.js";
+import { withWorkspaceLock } from "./workspace-lock.js";
 
 function readPositiveIntEnv(name, fallback) {
   const rawValue = Number.parseInt(process.env[name] || "", 10);
@@ -184,8 +187,11 @@ async function downloadStagedFile(drive, entry, root, snapshot = null) {
 }
 
 async function handleMissingUploadSource(drive, entry, snapshot, driveFolderId) {
-  const deleted = await deleteRemoteFile(drive, entry, snapshot, driveFolderId);
-  return deleted ? "deleted_remote" : "skipped";
+  // A source disappearing after staging invalidates the upload. It is not
+  // authorization to delete the remote object, which may have changed too.
+  throw Object.assign(new Error(`Upload source disappeared: ${entry.localPath || entry.path}. Refresh the sync plan.`), {
+    code: "SOURCE_CHANGED",
+  });
 }
 
 async function uploadStagedFile(drive, entry, root, driveFolderId, snapshot, context = null) {
@@ -509,42 +515,49 @@ function remoteOpWeight(entry) {
 
 async function runConcurrent(tasks, limit, onDone) {
   let next = 0;
-  let running = 0;
   let done = 0;
-
-  return new Promise((resolve, reject) => {
-    function launch() {
-      while (running < limit && next < tasks.length) {
-        const index = next++;
-        running++;
-        tasks[index]()
-          .then((result) => {
-            running--;
-            done++;
-            onDone?.(done, tasks.length, index, null, result);
-            if (done === tasks.length) resolve();
-            else launch();
-          })
-          .catch((err) => {
-            running--;
-            done++;
-            onDone?.(done, tasks.length, index, err, null);
-            if (done === tasks.length) resolve();
-            else launch();
-          });
-      }
+  let fatal = null;
+  const workers = Array.from({ length: Math.min(limit, tasks.length) }, async () => {
+    while (!fatal && next < tasks.length) {
+      const index = next++;
+      let error = null;
+      let result = null;
+      try { result = await tasks[index](); } catch (err) { error = err; }
+      try { onDone?.(++done, tasks.length, index, error, result); }
+      catch (err) { fatal = err; }
     }
-    if (tasks.length === 0) resolve();
-    else launch();
   });
+  // Wait for already-running transfers before releasing the workspace lock.
+  await Promise.all(workers);
+  if (fatal) throw fatal;
 }
 
 // ── Main executor ────────────────────────────────────────────────────
 
 export async function executeStaged(drive, root, progress) {
+  return withRunLog(root, "execute-staged", () =>
+    withWorkspaceLock(root, () => executeStagedOperations(drive, root, progress)));
+}
+
+async function executeStagedOperations(drive, root, progress) {
   const config = readConfig(root);
   const index = readIndex(root);
-  const staged = index.staged || [];
+  const journal = openExecutionJournal(root);
+  journal.assertRecoverable();
+  const previouslyCompleted = new Set(journal.completed().map(op => operationKey(op.original)));
+  const staged = (index.staged || []).filter(entry => !previouslyCompleted.has(operationKey(entry)));
+  logEvent("info", "sync.started", { operations: staged.length });
+  const operationIds = new Map(staged.map(entry => [entry, journal.newId()]));
+  const originals = new Map(staged.map(entry => [entry, structuredClone(entry)]));
+  const logOperation = (level, event, entry, error) => {
+    if (error?.code === "JOURNAL_IO") throw error;
+    const state = event.split(".").at(-1);
+    journal.record(operationIds.get(entry), state, originals.get(entry), entry);
+    logEvent(level, event, {
+      operationId: operationIds.get(entry), action: entry.action, path: entry.path,
+      sourcePath: entry.sourcePath, fileId: entry.fileId, error,
+    });
+  };
   const snapshot = readLatestSnapshot(root);
   const driveFolderId = config.drive_folder_id || null;
   const result = new CommitResult();
@@ -556,7 +569,16 @@ export async function executeStaged(drive, root, progress) {
   const localMoves = [];
   const remoteRenames = [];
   const remoteOps = [];
-  const failedPaths = new Set();
+  const failedEntries = new Set();
+  const failedMoves = [];
+  function assertDependencies(entry) {
+    const paths = [entry.path, entry.sourcePath, entry.localPath, entry.remotePath].filter(Boolean);
+    const overlaps = (left, right) => left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+    if (failedMoves.some(move => paths.some(candidate =>
+      [move.path, move.sourcePath].filter(Boolean).some(parent => overlaps(candidate, parent))))) {
+      throw Object.assign(new Error("Dependency failed: a required folder move did not complete."), { code: "DEPENDENCY_FAILED" });
+    }
+  }
 
   for (const [i, entry] of staged.entries()) {
     if (entry.action === "delete_local") {
@@ -578,11 +600,16 @@ export async function executeStaged(drive, root, progress) {
       (left.entry.sourcePath || left.entry.path).split("/").length
   );
   for (const { entry } of remoteRenames) {
+    logOperation("info", "operation.started", entry);
     try {
+      assertDependencies(entry);
       await renameRemoteFolder(drive, entry, driveFolderId);
       result.foldersRenamed++;
+      logOperation("info", "operation.completed", entry);
     } catch (err) {
-      failedPaths.add(entry.path);
+      logOperation("error", "operation.failed", entry, err);
+      failedEntries.add(entry);
+      failedMoves.push(entry);
       result.errors.push(`rename_remote ${entry.path}: ${err.message}`);
     }
   }
@@ -591,7 +618,7 @@ export async function executeStaged(drive, root, progress) {
   // pending remote targets so uploads land in the renamed folder instead of
   // recreating the old one.
   for (const { entry: rename } of remoteRenames) {
-    if (failedPaths.has(rename.path) || !rename.sourcePath) continue;
+    if (failedEntries.has(rename) || !rename.sourcePath) continue;
     const renameTargetPath = rename.remotePath || rename.path;
     for (const { entry } of remoteOps) {
       const remapped = remapPathAfterRename(
@@ -614,7 +641,9 @@ export async function executeStaged(drive, root, progress) {
       (left.entry.sourcePath || left.entry.path).split("/").length
   );
   for (const { entry } of localMoves) {
+    logOperation("info", "operation.started", entry);
     try {
+      assertDependencies(entry);
       await moveLocalFolder(
         {
           ...entry,
@@ -622,8 +651,11 @@ export async function executeStaged(drive, root, progress) {
         },
         root
       );
+      logOperation("info", "operation.completed", entry);
     } catch (err) {
-      failedPaths.add(entry.path);
+      logOperation("error", "operation.failed", entry, err);
+      failedEntries.add(entry);
+      failedMoves.push(entry);
       result.errors.push(`move_local ${entry.path}: ${err.message}`);
     }
   }
@@ -634,7 +666,7 @@ export async function executeStaged(drive, root, progress) {
   // the remote copy). Applied in executed (deepest-source-first) order so
   // nested moves compose to each entry's final path.
   for (const { entry: move } of localMoves) {
-    if (failedPaths.has(move.path) || !move.sourcePath) continue;
+    if (failedEntries.has(move) || !move.sourcePath) continue;
     const moveDestination = move.localPath || move.path;
     for (const { entry } of [...remoteOps, ...localDeletes]) {
       const remapped = remapPathAfterRename(
@@ -664,31 +696,42 @@ export async function executeStaged(drive, root, progress) {
     (left, right) => right.entry.path.split("/").length - left.entry.path.split("/").length
   );
 
-  await Promise.all(
+  const localDeleteResults = await Promise.allSettled(
     localFileDeletes.map(async ({ entry }) => {
+      logOperation("info", "operation.started", entry);
       try {
+        assertDependencies(entry);
         await deleteLocalFile(entry, root);
         result.deletedLocal++;
+        logOperation("info", "operation.completed", entry);
       } catch (err) {
-        failedPaths.add(entry.path);
+        logOperation("error", "operation.failed", entry, err);
+        failedEntries.add(entry);
         result.errors.push(`delete_local ${entry.path}: ${err.message}`);
       }
     })
   );
 
+  const fatalDelete = localDeleteResults.find(result => result.status === "rejected");
+  if (fatalDelete) throw fatalDelete.reason;
+
   const successfulLocalFileDeletes = localFileDeletes
-    .filter(({ entry }) => !failedPaths.has(entry.path))
+    .filter(({ entry }) => !failedEntries.has(entry))
     .sort((left, right) => right.entry.path.split("/").length - left.entry.path.split("/").length);
   for (const { entry } of successfulLocalFileDeletes) {
     await cleanupEmptyParentDirectories(root, entry.localPath || entry.path);
   }
 
   for (const { entry } of localFolderDeletes) {
+    logOperation("info", "operation.started", entry);
     try {
+      assertDependencies(entry);
       await deleteLocalFile(entry, root);
       result.deletedLocal++;
+      logOperation("info", "operation.completed", entry);
     } catch (err) {
-      failedPaths.add(entry.path);
+      logOperation("error", "operation.failed", entry, err);
+      failedEntries.add(entry);
       result.errors.push(`delete_local ${entry.path}: ${err.message}`);
     }
   }
@@ -706,6 +749,8 @@ export async function executeStaged(drive, root, progress) {
   // Run remote operations with bounded concurrency
   const tasks = remoteOps.map(({ entry }) => {
     return async () => {
+      logOperation("info", "operation.started", entry);
+      assertDependencies(entry);
       const action = entry.action;
       if (action === "download") {
         await downloadStagedFile(drive, entry, root, snapshot);
@@ -744,8 +789,11 @@ export async function executeStaged(drive, root, progress) {
     completed++;
     const op = remoteOps[idx];
     if (err) {
-      failedPaths.add(op.entry.path);
+      logOperation("error", "operation.failed", op.entry, err);
+      failedEntries.add(op.entry);
       result.errors.push(`${op.entry.action} ${op.entry.path}: ${err.message}`);
+    } else {
+      logOperation("info", "operation.completed", op.entry);
     }
     progress?.(completed - 1, staged.length, op.entry.action, path.posix.basename(op.entry.path || ""));
   });
@@ -753,12 +801,15 @@ export async function executeStaged(drive, root, progress) {
   progress?.(staged.length, staged.length, "done", "");
 
   // Only clear succeeded entries — keep failed ones staged for retry
-  if (failedPaths.size > 0) {
-    index.staged = staged.filter((e) => failedPaths.has(e.path));
+  if (failedEntries.size > 0) {
+    index.staged = staged.filter((e) => failedEntries.has(e));
   } else {
     index.staged = [];
   }
   writeIndex(root, index);
+  logEvent(result.errors.length ? "warn" : "info", "sync.finished", {
+    summary: result.summary, failures: result.errors.length, remainingStaged: index.staged.length,
+  });
 
   return result;
 }

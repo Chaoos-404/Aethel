@@ -19,6 +19,10 @@ import {
   writeConfig,
   writeSnapshot,
 } from "./config.js";
+import { advanceBaseline } from "./baseline.js";
+import { commitWorkspace } from "./commit-coordinator.js";
+import { withWorkspaceLock } from "./workspace-lock.js";
+import { logEvent, withRunLog } from "./logger.js";
 import { computeDiff } from "./diff.js";
 import {
   assertNoDuplicateFolders,
@@ -61,22 +65,10 @@ import {
   renameLocalEntry,
 } from "./local-fs.js";
 
-function isPathOrDescendant(pathValue, parentPath) {
-  return pathValue === parentPath || pathValue.startsWith(`${parentPath}/`);
-}
-
-function isTrackedBySnapshot(pathValue, snapshotFiles) {
-  return Object.values(snapshotFiles || {}).some((entry) => {
-    const snapshotPath = entry.path || entry.localPath;
-    return snapshotPath && isPathOrDescendant(snapshotPath, pathValue);
-  });
-}
-
 /**
  * Paths covered by Drive: every remote path plus each of its ancestors.
  *
- * Equivalent to testing isTrackedBySnapshot() against every path, but built
- * once instead of scanning the whole remote list per local file.
+ * Build once instead of scanning the whole remote list per local file.
  */
 function buildRemoteCoverage(remoteFiles) {
   const covered = new Set();
@@ -102,8 +94,8 @@ function buildRemoteCoverage(remoteFiles) {
  * A file recorded here without a remote counterpart matches its own baseline
  * forever, so no later diff reports it and `aethel add` — which can only stage
  * entries present in the diff — can never reach it. The file becomes invisible
- * and is never uploaded. buildPulledLocalSnapshot() already enforces this
- * invariant on the pull path; ordinary syncs need it too.
+ * and is never uploaded. Initialization must not introduce such entries;
+ * subsequent commits use the operation-scoped baseline updater.
  *
  * Safe against dropping a just-uploaded file: push re-fetches remote state
  * after the upload completes, so successful uploads are present here, while a
@@ -121,93 +113,6 @@ function buildSyncedLocalSnapshot(scannedLocal, remoteFiles) {
   }
 
   return { files, packedDirs: scannedLocal?.packedDirs ?? {} };
-}
-
-function removePathAndDescendants(files, pathValue) {
-  for (const candidate of Object.keys(files)) {
-    if (isPathOrDescendant(candidate, pathValue)) {
-      delete files[candidate];
-    }
-  }
-}
-
-function addPulledRemotePaths(files, scannedLocalFiles, remoteFiles, pathValue) {
-  for (const remoteFile of remoteFiles) {
-    if (!remoteFile.path || !isPathOrDescendant(remoteFile.path, pathValue)) {
-      continue;
-    }
-    const localEntry = scannedLocalFiles[remoteFile.path];
-    if (localEntry) {
-      files[remoteFile.path] = localEntry;
-    }
-  }
-}
-
-/**
- * Build the local half of a pull snapshot without accepting unrelated local
- * edits as synced. A pull may change only selected remote paths; local-only
- * additions and local modifications must retain their pre-pull baseline so a
- * later push still detects them.
- */
-function buildPulledLocalSnapshot(previousSnapshot, scannedLocal, remoteFiles, pullChanges) {
-  const scannedLocalFiles = scannedLocal?.files ?? scannedLocal ?? {};
-  const files = {};
-
-  // A previous buggy pull could already have captured local-only paths. Keep
-  // only entries that were backed by a Drive item in the prior snapshot.
-  for (const [pathValue, entry] of Object.entries(previousSnapshot?.localFiles || {})) {
-    if (isTrackedBySnapshot(pathValue, previousSnapshot?.files)) {
-      files[pathValue] = entry;
-    }
-  }
-
-  for (const change of pullChanges || []) {
-    const action = change.suggestedAction || change.action;
-    const pathValue = change.remoteMeta?.path || change.path;
-    if (!pathValue) continue;
-
-    if (action === "delete_local") {
-      removePathAndDescendants(files, pathValue);
-      continue;
-    }
-
-    if (action === "move_local") {
-      // Carry the previous baseline across the move by remapping its keys.
-      // Adopting the post-move scan instead would record a locally-edited
-      // file's current hash as "synced" and silently swallow its pending
-      // upload on the next push.
-      if (change.sourcePath) {
-        const movedEntries = {};
-        for (const [candidate, entry] of Object.entries(files)) {
-          if (!isPathOrDescendant(candidate, change.sourcePath)) continue;
-          const movedPath = `${pathValue}${candidate.slice(change.sourcePath.length)}`;
-          movedEntries[movedPath] = entry.localPath
-            ? { ...entry, localPath: movedPath }
-            : entry;
-          delete files[candidate];
-        }
-        Object.assign(files, movedEntries);
-      }
-      // Fill only the gaps (paths with no carried baseline) from the scan.
-      for (const remoteFile of remoteFiles) {
-        if (!remoteFile.path || !isPathOrDescendant(remoteFile.path, pathValue)) {
-          continue;
-        }
-        if (files[remoteFile.path]) continue;
-        const localEntry = scannedLocalFiles[remoteFile.path];
-        if (localEntry) {
-          files[remoteFile.path] = localEntry;
-        }
-      }
-      continue;
-    }
-
-    if (action === "download") {
-      addPulledRemotePaths(files, scannedLocalFiles, remoteFiles, pathValue);
-    }
-  }
-
-  return files;
 }
 
 export class Repository {
@@ -246,6 +151,7 @@ export class Repository {
     if (this._drive) return;
     const raw = await authenticate(this._options.credentials, this._options.token, {
       force: Boolean(this._options.forceAuth),
+      nonInteractive: Boolean(this._options.nonInteractive),
     });
     this._drive = withDriveRetry(raw);
   }
@@ -280,7 +186,11 @@ export class Repository {
    * Load full workspace state in parallel, replacing the old
    * loadWorkspaceState() helper from cli.js.
    */
-  async loadState({ useCache = true, remoteCacheTtlMs, onPhase } = {}) {
+  async loadState(options = {}) {
+    return withRunLog(this._root, "load-state", () => this._loadStateForSync(options));
+  }
+
+  async _loadStateForSync({ useCache = false, remoteCacheTtlMs, onPhase } = {}) {
     const config = this.getConfig();
     const t0 = Date.now();
 
@@ -322,6 +232,10 @@ export class Repository {
     timings.totalMs = Date.now() - t0;
     timings.localFiles = Object.keys(local).length;
     timings.remoteFiles = remote.length;
+    logEvent("info", "state.compared", {
+      changes: diff.changes.length, conflicts: diff.conflicts.length, timings,
+      cacheRequested: useCache,
+    });
 
     return {
       config,
@@ -334,7 +248,7 @@ export class Repository {
     };
   }
 
-  async getRemoteState({ useCache = true, snapshot } = {}) {
+  async getRemoteState({ useCache = false, snapshot } = {}) {
     return this._loadRemoteState({ useCache, snapshot });
   }
 
@@ -390,14 +304,12 @@ export class Repository {
     return executeStaged(this.drive, this._root, progress);
   }
 
-  async commitStaged({ message = "sync", snapshotHint, progress } = {}) {
-    const result = await this.executeStaged(progress);
-    if (result.errors.length > 0) {
-      return result;
-    }
+  async commitStaged(options = {}) {
+    return withRunLog(this._root, "commit", () => this._commitStaged(options));
+  }
 
-    await this.saveSnapshot(message, snapshotHint);
-    return result;
+  async _commitStaged({ message = "sync", progress } = {}) {
+    return commitWorkspace(this, { message, progress });
   }
 
   /**
@@ -408,9 +320,20 @@ export class Repository {
    * @param {object} [preloaded.remote]  Reuse this remote state (skip API call)
    * @param {object} [preloaded.local]   Reuse this local scan  (skip fs walk)
    */
-  async saveSnapshot(message = "sync", { remote, local, pullChanges } = {}) {
+  async saveSnapshot(message = "sync", options = {}) {
+    return withRunLog(this._root, "save-baseline", () =>
+      withWorkspaceLock(this._root, () => this._saveSnapshot(message, options)));
+  }
+
+  async _saveSnapshot(message, { remote, local, pullChanges, appliedChanges, executionReceipts } = {}) {
     const config = this.getConfig();
     const rootFolderId = config.drive_folder_id || null;
+    const operations = appliedChanges ?? pullChanges;
+    // A pull can share a staging area with uploads. Its preloaded Drive
+    // listing is no longer authoritative once any remote mutation executed.
+    if (operations?.some(change => ["upload", "delete_remote", "rename_remote", "push_pack"].includes(change.action || change.suggestedAction))) {
+      remote = undefined;
+    }
 
     // Only fetch what wasn't pre-loaded, in parallel.
     const needRemote = !remote;
@@ -428,19 +351,13 @@ export class Repository {
 
     assertNoDuplicateFolders(remoteState.duplicateFolders);
     writeRemoteCache(this._root, remoteState, rootFolderId);
-    const snapshotLocalFiles = pullChanges
-      ? {
-          files: buildPulledLocalSnapshot(
-            readLatestSnapshot(this._root),
-            localFiles,
-            remoteState.files,
-            pullChanges
-          ),
-          packedDirs: localFiles?.packedDirs ?? {},
-        }
-      : buildSyncedLocalSnapshot(localFiles, remoteState.files);
-    const snapshot = buildSnapshot(remoteState.files, snapshotLocalFiles, message);
+    const nextBaseline = operations
+      ? advanceBaseline(readLatestSnapshot(this._root), remoteState.files, localFiles, operations)
+      : { remote: remoteState.files, local: buildSyncedLocalSnapshot(localFiles, remoteState.files) };
+    const snapshot = buildSnapshot(nextBaseline.remote, nextBaseline.local, message);
+    if (executionReceipts) snapshot.executionReceipts = executionReceipts;
     writeSnapshot(this._root, snapshot);
+    logEvent("info", "baseline.saved", { operations: operations?.length ?? null });
     this.updateCurrentBranch(snapshot);
   }
 

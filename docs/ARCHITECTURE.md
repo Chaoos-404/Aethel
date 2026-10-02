@@ -178,11 +178,57 @@ local ancestor, and deduplicated so removed folder trees are pruned in one pass.
 
 `commit` is not a Git commit. It executes the synchronization actions currently staged:
 
-1. Read `index.json`
-2. Route each entry by action as `download / upload / delete_local / delete_remote`
-3. Execute local and remote operations
-4. Clear staged entries
-5. Rebuild the snapshot and write the new state to `.aethel/snapshots/latest.json`
+1. Acquire the workspace execution lock and recover unacknowledged completions.
+2. Read `index.json` and assign durable operation IDs.
+3. Flush each start record before mutation and each completion record afterward.
+4. Retain failed entries and block operations that depend on failed folder moves.
+5. Advance the baseline for completed operations, including partial successes.
+6. Persist receipt IDs with the snapshot before retiring their journal records.
+
+`commit-coordinator.js` owns this sequence for CLI and repository commits.
+`execution-journal.js` records execution outcomes independently of diagnostics.
+`workspace-lock.js` serializes commit execution and snapshot saving. The low-level
+executor may clear completed staging entries after their receipts are durable;
+those receipts remain recoverable until the coordinator saves the baseline.
+
+`src/core/baseline.js` owns baseline advancement for commits and pulls. A fresh
+Drive listing is an observation, not proof that this device applied every remote
+change. Unapplied entries retain their previous IDs, paths, and hashes. This
+prevents an unrelated push on device B from forgetting a rename or deletion
+made by device A and later treating B's old file as a new local addition.
+Metadata moves carry the previous content hashes to the new paths, so pending
+content edits remain visible. Transfers advance only matching local and remote
+content; deletions advance only their completed scope.
+
+Normal sync and status commands refresh remote observations, using the Drive
+memo and changes feed where available. The observation cache and the per-device
+sync baseline have separate purposes and must not replace one another.
+Failed commits retain failed staging entries. Their completed operations still
+advance the baseline. Snapshot failures preserve receipts for the next commit.
+A snapshot records receipt IDs so recovery does not apply metadata moves twice.
+Interrupted starts without durable outcomes stop with `RECOVERY_REQUIRED`.
+Locks are not automatically stolen after process termination. This protects
+against overlapping work but requires operator review after a hard crash.
+The lock covers this local workspace, not other devices or direct Drive edits.
+
+### 4.4 Diagnostic Logging
+
+`src/core/logger.js` owns structured diagnostics, sanitization, retention, and
+run context. `AsyncLocalStorage` carries the run ID through concurrent transfers
+and nested repository calls. Standalone executor calls create their own run;
+CLI calls share one context across state loading, execution, and baseline saving.
+Each operation has a durable UUID to correlate journal records and diagnostic events.
+
+One exclusively created file per run avoids shared-file rotation races. Records
+are bounded JSON lines with schema version, UTC timestamp, process ID, sequence,
+severity, event, and details. Completion flushes the file and removes its
+`.active` suffix. A crash can leave an active file or an incomplete trailing
+record; it must not be interpreted as successful completion.
+
+Retention runs at creation and completion. Completed files are limited to 20
+and seven days; active files expire after seven days. Each run is limited to
+5 MiB with a reserved terminal record. Diagnostic I/O errors are isolated from
+sync errors. Logs are local to `.aethel` and are excluded from synchronization.
 
 ## 5. Relationship Between TUI and CLI
 

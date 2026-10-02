@@ -1,11 +1,9 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import fsNative from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
-import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { initWorkspace, readIndex, writeIndex, writeSnapshot } from "../src/core/config.js";
 import {
@@ -22,287 +20,9 @@ import {
   withDriveRetry,
 } from "../src/core/drive-api.js";
 import { executeStaged } from "../src/core/sync.js";
+import { createTempDirectory } from "../test-support/workspace.js";
 
-const FOLDER_MIME = "application/vnd.google-apps.folder";
-
-function folder(id, name, parentId, createdTime) {
-  return {
-    id,
-    name,
-    mimeType: FOLDER_MIME,
-    parents: parentId ? [parentId] : [],
-    createdTime,
-    modifiedTime: createdTime,
-    md5Checksum: null,
-    size: null,
-    capabilities: {
-      canAddChildren: true,
-      canEdit: true,
-      canTrash: true,
-      canDelete: true,
-      canRename: true,
-    },
-    trashed: false,
-  };
-}
-
-function file(id, name, parentId, createdTime, md5Checksum) {
-  return {
-    id,
-    name,
-    mimeType: "application/octet-stream",
-    parents: [parentId],
-    createdTime,
-    modifiedTime: createdTime,
-    md5Checksum,
-    size: 1,
-    capabilities: {
-      canAddChildren: false,
-      canEdit: true,
-      canTrash: true,
-      canDelete: true,
-      canRename: true,
-    },
-    trashed: false,
-  };
-}
-
-function clone(value) {
-  return JSON.parse(JSON.stringify(value));
-}
-
-function md5(buffer) {
-  return createHash("md5").update(buffer).digest("hex");
-}
-
-function createFakeDrive(initialItems = [], { listDelayMs = 0 } = {}) {
-  const items = new Map(initialItems.map((item) => [item.id, clone(item)]));
-  let sequence = 0;
-  let idCounter = 1000;
-  let changeSequence = 0;
-  const changesLog = [];
-  const listQueries = [];
-
-  function recordChange(item, removed = false) {
-    changesLog.push({
-      seq: ++changeSequence,
-      fileId: item.id,
-      removed,
-      file: removed ? undefined : clone(item),
-    });
-  }
-
-  function decodeQueryValue(value) {
-    return value.replace(/\\\\/g, "\\").replace(/\\'/g, "'");
-  }
-
-  function matches(item, query) {
-    if (!query) {
-      return true;
-    }
-
-    return query.split(" and ").every((part) => {
-      if (part === "trashed = false") {
-        return !item.trashed;
-      }
-
-      const nameMatch = part.match(/^name = '(.+)'$/);
-      if (nameMatch) {
-        return item.name === decodeQueryValue(nameMatch[1]);
-      }
-
-      const mimeMatch = part.match(/^mimeType = '(.+)'$/);
-      if (mimeMatch) {
-        return item.mimeType === decodeQueryValue(mimeMatch[1]);
-      }
-
-      const mimeExclusionMatch = part.match(/^mimeType != '(.+)'$/);
-      if (mimeExclusionMatch) {
-        return item.mimeType !== decodeQueryValue(mimeExclusionMatch[1]);
-      }
-
-      const parentMatch = part.match(/^'(.+)' in parents$/);
-      if (parentMatch) {
-        return (item.parents || []).includes(parentMatch[1]);
-      }
-
-      return true;
-    });
-  }
-
-  async function drain(stream) {
-    if (!stream) {
-      return Buffer.alloc(0);
-    }
-
-    const chunks = [];
-    for await (const chunk of stream) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    }
-    return Buffer.concat(chunks);
-  }
-
-  function touch(item) {
-    item.modifiedTime = new Date(1700000000000 + sequence++).toISOString();
-  }
-
-  return {
-    files: {
-      async list({ q, pageSize = 1000, pageToken, orderBy }) {
-        if (listDelayMs) {
-          await delay(listDelayMs);
-        }
-
-        listQueries.push(q || "");
-
-        const matchesQuery = [...items.values()].filter((item) => matches(item, q));
-        matchesQuery.sort((left, right) => {
-          if (orderBy === "createdTime desc") {
-            return Date.parse(right.createdTime) - Date.parse(left.createdTime);
-          }
-          return String(left.id).localeCompare(String(right.id));
-        });
-
-        const start = Number(pageToken || 0);
-        const slice = matchesQuery.slice(start, start + pageSize).map(clone);
-        const nextPageToken =
-          start + pageSize < matchesQuery.length ? String(start + pageSize) : undefined;
-
-        return {
-          data: {
-            files: slice,
-            nextPageToken,
-          },
-        };
-      },
-      async create({ requestBody, media }) {
-        const body = await drain(media?.body);
-        const id = `id-${++idCounter}`;
-        const createdTime = new Date(1700000000000 + sequence++).toISOString();
-        const item = {
-          id,
-          name: requestBody.name,
-          mimeType: requestBody.mimeType || "application/octet-stream",
-          parents: requestBody.parents || [],
-          createdTime,
-          modifiedTime: createdTime,
-          md5Checksum: requestBody.mimeType === FOLDER_MIME ? null : md5(body),
-          size: requestBody.mimeType === FOLDER_MIME ? null : body.length,
-          capabilities: {
-            canAddChildren: true,
-            canEdit: true,
-            canTrash: true,
-            canDelete: true,
-            canRename: true,
-          },
-          trashed: false,
-          _body: body.toString("utf8"),
-        };
-        items.set(id, item);
-        recordChange(item);
-        return { data: clone(item) };
-      },
-      async update({ fileId, requestBody = {}, addParents, removeParents, media }) {
-        const body = await drain(media?.body);
-        const item = items.get(fileId);
-
-        if (!item) {
-          const err = new Error(`File not found: ${fileId}`);
-          err.code = 404;
-          throw err;
-        }
-
-        if (requestBody.name) {
-          item.name = requestBody.name;
-        }
-
-        if (Object.hasOwn(requestBody, "trashed")) {
-          item.trashed = Boolean(requestBody.trashed);
-        }
-
-        if (addParents || removeParents) {
-          const nextParents = new Set(item.parents || []);
-          for (const parentId of String(removeParents || "")
-            .split(",")
-            .filter(Boolean)) {
-            nextParents.delete(parentId);
-          }
-          if (addParents) {
-            nextParents.add(addParents);
-          }
-          item.parents = [...nextParents];
-        }
-
-        if (body.length && item.mimeType !== FOLDER_MIME) {
-          item._body = body.toString("utf8");
-          item.md5Checksum = md5(body);
-          item.size = body.length;
-        }
-
-        touch(item);
-        recordChange(item);
-        return { data: clone(item) };
-      },
-      async delete({ fileId }) {
-        const item = items.get(fileId);
-        items.delete(fileId);
-        if (item) {
-          recordChange(item, true);
-        }
-        return { data: {} };
-      },
-      async get({ fileId, alt }) {
-        if (fileId === "root") {
-          return {
-            data: {
-              id: "root",
-              name: "My Drive",
-              mimeType: FOLDER_MIME,
-              parents: [],
-              capabilities: {
-                canAddChildren: true,
-                canEdit: true,
-              },
-            },
-          };
-        }
-
-        if (alt === "media") {
-          return { data: Readable.from([items.get(fileId)?._body || ""]) };
-        }
-
-        return { data: clone(items.get(fileId)) };
-      },
-    },
-    changes: {
-      async getStartPageToken() {
-        return { data: { startPageToken: String(changeSequence) } };
-      },
-      async list({ pageToken }) {
-        const since = Number(pageToken || 0);
-        return {
-          data: {
-            changes: changesLog
-              .filter((change) => change.seq > since)
-              .map(({ seq, ...change }) => clone(change)),
-            newStartPageToken: String(changeSequence),
-          },
-        };
-      },
-    },
-    snapshot() {
-      return [...items.values()]
-        .map(clone)
-        .sort((left, right) => String(left.id).localeCompare(String(right.id)));
-    },
-    listQueries() {
-      return [...listQueries];
-    },
-    clearListQueries() {
-      listQueries.length = 0;
-    },
-  };
-}
+import { FOLDER_MIME, folder, file, md5, createFakeDrive } from "../test-support/fake-drive.js";
 
 /**
  * True when the drive was asked for a whole-drive listing. The global fetch
@@ -682,7 +402,7 @@ test("getRemoteState memo tracks a new folder chain reported deepest-first", asy
     ...chain.map((item) => ({ fileId: item.id, file: item })),
   ];
   drive.changes.list = async () => ({
-    data: { changes: memoChanges.map(clone), newStartPageToken: "999" },
+    data: { changes: structuredClone(memoChanges), newStartPageToken: "999" },
   });
 
   const state = await getRemoteState(drive, "project", null, options);
@@ -1066,7 +786,7 @@ test("executeStaged treats missing path-only delete_remote entries as already de
   }
 });
 
-test("executeStaged treats missing staged upload source as local deletion", async () => {
+test("executeStaged preserves remote content when a staged upload source disappears", async () => {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-stale-upload-"));
 
   try {
@@ -1088,17 +808,17 @@ test("executeStaged treats missing staged upload source as local deletion", asyn
     ]);
     const result = await executeStaged(drive, workspaceRoot);
 
-    assert.equal(result.errors.length, 0);
-    assert.equal(result.deletedRemote, 1);
+    assert.equal(result.errors.length, 1);
+    assert.equal(result.deletedRemote, 0);
     assert.equal(result.uploaded, 0);
-    assert.equal(readIndex(workspaceRoot).staged.length, 0);
-    assert.equal(drive.snapshot().find((item) => item.id === "remote-file").trashed, true);
+    assert.equal(readIndex(workspaceRoot).staged.length, 1);
+    assert.equal(drive.snapshot().find((item) => item.id === "remote-file").trashed, false);
   } finally {
     await fs.rm(workspaceRoot, { recursive: true, force: true });
   }
 });
 
-test("executeStaged drops missing staged upload source when no remote exists", async () => {
+test("executeStaged retains a missing staged upload for replanning", async () => {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-stale-new-upload-"));
 
   try {
@@ -1116,9 +836,9 @@ test("executeStaged drops missing staged upload source when no remote exists", a
     const drive = createFakeDrive([]);
     const result = await executeStaged(drive, workspaceRoot);
 
-    assert.equal(result.errors.length, 0);
+    assert.equal(result.errors.length, 1);
     assert.equal(result.total, 0);
-    assert.equal(readIndex(workspaceRoot).staged.length, 0);
+    assert.equal(readIndex(workspaceRoot).staged.length, 1);
     assert.equal(drive.snapshot().length, 0);
   } finally {
     await fs.rm(workspaceRoot, { recursive: true, force: true });
@@ -1465,7 +1185,7 @@ test("uploadFile updates an existing same-name file and trashes duplicates", asy
   }
 });
 
-test("uploadFile falls back from a stale fileId to same-name remote file", async () => {
+test("uploadFile does not replace unrelated same-name files when a tracked ID disappears", async () => {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-upload-"));
 
   try {
@@ -1477,20 +1197,14 @@ test("uploadFile falls back from a stale fileId to same-name remote file", async
       file("remote-2", "report.md", "root", "2026-04-04T10:35:00.000Z", "old-2"),
     ]);
 
-    const result = await uploadFile(drive, localPath, "report.md", {
+    await assert.rejects(uploadFile(drive, localPath, "report.md", {
       parentId: "root",
       existingId: "stale-id",
       cleanupDuplicates: true,
-    });
+    }), { code: "REMOTE_CHANGED" });
+    const active = drive.snapshot().filter(item => !item.trashed);
+    assert.deepEqual(active.map(item => item.md5Checksum).sort(), ["old-1", "old-2"]);
 
-    const snapshot = drive.snapshot();
-    const activeReports = snapshot.filter((item) => item.name === "report.md" && !item.trashed);
-    const trashedReports = snapshot.filter((item) => item.name === "report.md" && item.trashed);
-
-    assert.equal(result.id, "remote-1");
-    assert.equal(activeReports.length, 1);
-    assert.equal(activeReports[0].md5Checksum, md5(Buffer.from("new content")));
-    assert.deepEqual(trashedReports.map((item) => item.id), ["remote-2"]);
   } finally {
     await fs.rm(workspaceRoot, { recursive: true, force: true });
   }
@@ -1884,4 +1598,23 @@ test("executeStaged renames a remote folder without a fileId and remaps staged u
   } finally {
     await fs.rm(workspaceRoot, { recursive: true, force: true });
   }
+});
+
+test("download failure preserves the previous destination and removes scratch files", async t => {
+  const root = createTempDirectory(t, "aethel-preserve-download-");
+  const target = path.join(root, "important");
+  const drive = {
+    files: {
+      async get() { throw new Error("access revoked"); },
+    },
+  };
+  await fs.writeFile(target, "original");
+
+  await assert.rejects(
+    downloadFile(drive, { id: "f", mimeType: "application/octet-stream" }, target),
+    /access revoked/
+  );
+
+  assert.equal(await fs.readFile(target, "utf8"), "original");
+  assert.deepEqual(await fs.readdir(root), ["important"]);
 });

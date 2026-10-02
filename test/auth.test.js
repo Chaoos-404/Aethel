@@ -102,3 +102,13 @@ test("authenticate hands the shared agent to the Drive client", () => {
   assert.match(authSource, /const agent = getDriveAgent\(\);/);
   assert.match(authSource, /drive\(\{ version: "v3", auth: authClient, \.\.\.\(agent \? \{ agent \} : \{\}\) \}\)/);
 });
+
+test('non-interactive authentication never falls back to browser login', async () => {
+  resetAuth();
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'aethel-no-browser-'));
+  try {
+    const credentials = path.join(temp, 'credentials.json');
+    fs.writeFileSync(credentials, JSON.stringify({ installed: { client_id: 'test', client_secret: 'test' } }));
+    await assert.rejects(getAuthClient(credentials, path.join(temp, 'missing-token'), { nonInteractive: true }), { code: 'AUTH_REQUIRED' });
+  } finally { resetAuth(); fs.rmSync(temp, { recursive: true, force: true }); }
+});

@@ -52,39 +52,31 @@ export function createSpinner(message) {
   };
 }
 
-export function createProgressBar(label, total) {
+export function createProgressBar(label, total, { stream = process.stderr, now = Date.now } = {}) {
   let lastRendered = -1;
+  let lastOutputAt = Number.NEGATIVE_INFINITY;
 
   function render(current) {
-    if (current === lastRendered) return;
-    lastRendered = current;
-
-    const ratio = total > 0 ? Math.min(current / total, 1) : 0;
+    const processed = Math.max(0, Math.min(current, total));
+    if (processed === lastRendered) return;
+    const timestamp = now();
+    // Piped/scheduled runs still report progress, without one line per file.
+    if (!stream.isTTY && processed !== total && timestamp - lastOutputAt < 1000) return;
+    lastRendered = processed;
+    lastOutputAt = timestamp;
+    const ratio = total > 0 ? processed / total : 1;
     const filled = Math.round(BAR_WIDTH * ratio);
-    const empty = BAR_WIDTH - filled;
-    const pct = Math.round(ratio * 100);
-    const bar = "█".repeat(filled) + "░".repeat(empty);
-    const line = `${label} [${bar}] ${current}/${total} (${pct}%)`;
-
-    if (isTTY) {
-      clearLine();
-      process.stderr.write(line);
-    }
+    const bar = "█".repeat(filled) + "░".repeat(BAR_WIDTH - filled);
+    const line = `${label} [${bar}] ${processed}/${total} (${Math.round(ratio * 100)}%)`;
+    stream.write(stream.isTTY ? `\r\x1b[K${line}` : `${line}\n`);
   }
 
-  // Initial render
   render(0);
-
   return {
     update(current) { render(current); },
     done(msg) {
       render(total);
-      if (isTTY) {
-        clearLine();
-        process.stderr.write(`✔ ${msg || label}\n`);
-      } else {
-        process.stderr.write(`${msg || label}\n`);
-      }
+      stream.write(stream.isTTY ? `\r\x1b[K${msg || label}\n` : `${msg || label}\n`);
     },
   };
 }

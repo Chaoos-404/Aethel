@@ -275,10 +275,10 @@ function authCacheKey(credentialsPath, tokenPath) {
  * same credential+token paths share a single in-flight auth attempt,
  * preventing duplicate browser prompts and token-refresh races.
  */
-export async function getAuthClient(credentialsPath, tokenPath) {
+export async function getAuthClient(credentialsPath, tokenPath, { nonInteractive = false } = {}) {
   const resolvedCredentials = resolveCredentialsPath(credentialsPath);
   const resolvedToken = resolveTokenPath(tokenPath);
-  const key = authCacheKey(resolvedCredentials, resolvedToken);
+  const key = `${authCacheKey(resolvedCredentials, resolvedToken)}:${nonInteractive}`;
 
   if (_authPromise && _authKey === key) {
     return _authPromise;
@@ -288,7 +288,11 @@ export async function getAuthClient(credentialsPath, tokenPath) {
   _authPromise = (async () => {
     const config = await loadClientConfig(resolvedCredentials);
     const cached = await loadCachedClient(config, resolvedToken);
-    return cached || (await runLocalServerAuth(config, resolvedToken));
+    if (cached) return cached;
+    if (nonInteractive) {
+      throw Object.assign(new Error("Authentication required. Run 'aethel auth' interactively."), { code: "AUTH_REQUIRED" });
+    }
+    return runLocalServerAuth(config, resolvedToken);
   })();
 
   try {
@@ -337,10 +341,13 @@ export function resetAuth() {
  * for finer control.
  */
 export async function authenticate(credentialsPath, tokenPath, options = {}) {
+  if (options.force && options.nonInteractive) {
+    throw Object.assign(new Error("Browser authentication is unavailable in non-interactive mode."), { code: "AUTH_REQUIRED" });
+  }
   const [authClient, { drive }] = await Promise.all([
     options.force
       ? refreshAuthClient(credentialsPath, tokenPath)
-      : getAuthClient(credentialsPath, tokenPath),
+      : getAuthClient(credentialsPath, tokenPath, options),
     loadGoogleApi(),
   ]);
   // Options passed here are merged into every request googleapis makes, so

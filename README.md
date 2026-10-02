@@ -88,7 +88,50 @@ snapshot -> status/diff -> add/resolve -> commit
 
 `status`, `add`, `pull`, and `push` compare three states: the latest Aethel
 snapshot, Google Drive, and your local files. A successful `commit`, `pull`, or
-`push` saves a new snapshot so the next sync has a clear baseline.
+`push` saves a new snapshot for the operations it applied. Remote changes that
+this device has not applied retain their previous baseline, including renames
+and deletions from another device. Normal commands refresh Drive observations
+before comparing changes.
+
+Scheduled `pull` and `push` runs can use `--non-interactive` to prevent browser
+authentication. Without `--force`, conflicts remain unresolved while unrelated
+changes can proceed; the command exits with code 2 when conflicts are detected.
+Staged execution failures exit with code 3. Transfer progress is also written to
+stderr when output is redirected, so scheduled runs report their progress.
+
+### Commit Recovery
+
+A commit checkpoints completed operations even when other operations fail.
+Failed entries remain staged. If snapshot saving fails, the next `aethel commit`
+uses `.aethel/execution.jsonl` to finish checkpointing without replaying completed
+transfers. This also works when no entries remain staged.
+
+The workspace execution lock is `.aethel/sync.lock`. Concurrent commits are
+rejected. A terminated process can leave this lock behind: its owner PID and
+hostname must be checked before an operator removes it. An interrupted operation
+without a durable outcome stops with `RECOVERY_REQUIRED`; its effects need to be
+reconciled before retrying. The execution journal must be preserved for that
+review. Recovery does not yet automatically resolve these ambiguous outcomes.
+
+### Diagnostic Logs
+
+Commands run inside an initialized workspace write JSON-lines logs under
+`.aethel/logs/`. Each run has a unique ID; operation events include an operation
+ID, action, path, outcome, and sanitized error. State comparisons record cache
+usage, conflict counts, and timings. Baseline saves are recorded separately.
+
+Completed runs use `<run-id>.jsonl`; running or interrupted runs use
+`<run-id>.active.jsonl`. The next run removes completed logs beyond the newest
+20 files or seven days, and abandoned active files older than seven days.
+Each file is capped at 5 MiB, with space reserved for its final outcome.
+After the cap is reached, intermediate events are omitted and
+`log.limit_reached` records the omission.
+
+Logs exclude file contents and API request/response bodies, redact known
+credential fields and URLs, and use restrictive permissions where supported.
+They contain file names and paths, so review them before sharing. Logging
+failures produce one stderr warning per run and do not interrupt synchronization.
+These logs support diagnosis; they are not a transaction journal for recovery.
 
 ### Review Changes
 

@@ -1187,12 +1187,12 @@ async function exportToPath(drive, fileMeta, exportInfo, targetPath) {
 async function downloadMediaToPath(drive, fileMeta, localPath) {
   // Stream to disk while computing MD5 in parallel
   const md5 = crypto.createHash("md5");
-  const writeStream = fs.createWriteStream(localPath);
   const response = await drive.files.get(
     { fileId: fileMeta.id, alt: "media", supportsAllDrives: true },
     { responseType: "stream" }
   );
 
+  const writeStream = fs.createWriteStream(localPath);
   // Tee: pipe to both disk and hasher
   response.data.on("data", (chunk) => md5.update(chunk));
   await pipeline(response.data, writeStream);
@@ -1213,45 +1213,29 @@ async function downloadMediaToPath(drive, fileMeta, localPath) {
 }
 
 export async function downloadFile(drive, fileMeta, localPath) {
-  fs.mkdirSync(path.dirname(localPath), { recursive: true });
-
   const mime = fileMeta.mimeType || "";
   const exportInfo = EXPORT_MAP[mime];
-
-  if (exportInfo) {
-    let targetPath = localPath;
-    if (!targetPath.endsWith(exportInfo.ext)) {
-      const parsed = path.parse(targetPath);
-      targetPath = path.join(parsed.dir, parsed.name + exportInfo.ext);
-    }
-
-    // Exported files have no md5Checksum from Drive — skip verification
-    await withStreamRetry(() =>
-      exportToPath(drive, fileMeta, exportInfo, targetPath)
-    );
-    return;
+  let targetPath = localPath;
+  if (exportInfo && !targetPath.endsWith(exportInfo.ext)) {
+    const parsed = path.parse(targetPath);
+    targetPath = path.join(parsed.dir, parsed.name + exportInfo.ext);
   }
-
-  if (isWorkspaceType(mime)) {
-    throw new Error(
-      `Cannot download Google Workspace file '${fileMeta.name || fileMeta.id}' ` +
-        `with unsupported mimeType '${mime}'`
-    );
+  if (!exportInfo && isWorkspaceType(mime)) {
+    throw new Error(`Cannot download Google Workspace file '${fileMeta.name || fileMeta.id}' with unsupported mimeType '${mime}'`);
   }
-
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  const temp = path.join(path.dirname(targetPath), `.aethel-download-${crypto.randomUUID()}`);
   try {
-    // Each attempt reopens the write stream, which truncates — a retry always
-    // restarts from byte zero rather than appending to a partial file.
-    await withStreamRetry(() => downloadMediaToPath(drive, fileMeta, localPath));
-  } catch (err) {
-    // The write stream truncated the file on open, so whatever is on disk is
-    // already unusable — leave nothing behind for the next scan to pick up.
-    try {
-      fs.unlinkSync(localPath);
-    } catch {
-      // Nothing was written, or it is already gone.
-    }
-    throw err;
+    await withStreamRetry(() => exportInfo
+      ? exportToPath(drive, fileMeta, exportInfo, temp)
+      : downloadMediaToPath(drive, fileMeta, temp));
+    const handle = await fs.promises.open(temp, "r+");
+    try { await handle.sync(); } finally { await handle.close(); }
+    // Only a completely downloaded and verified file replaces the old bytes.
+    // On Windows a locked destination leaves the original intact.
+    await fs.promises.rename(temp, targetPath);
+  } finally {
+    await fs.promises.rm(temp, { force: true });
   }
 }
 
@@ -1326,9 +1310,12 @@ export async function uploadFile(
       }
       return withStreamedMd5(response.data);
     } catch (err) {
-      if (!isMissingDriveFileError(err)) {
-        throw err;
+      if (isMissingDriveFileError(err)) {
+        throw Object.assign(new Error(`Tracked Drive file ${existingId} is missing or inaccessible. Refresh the plan before uploading.`), {
+          code: "REMOTE_CHANGED", cause: err,
+        });
       }
+      throw err;
     }
   }
 

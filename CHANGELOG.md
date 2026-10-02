@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.19 (2026-10-02)
+
+- Rebuild sync core: durable commit journal with crash recovery, workspace lock, per-device baseline that preserves unapplied remote changes, structured diagnostic logs, and non-interactive scheduled runs with distinct exit codes
+
 ## 1.3.18 (2026-08-27)
 
 - Reconcile files recreated at renamed Drive paths without false conflicts

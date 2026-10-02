@@ -84,7 +84,10 @@ function ruleExists(config, packPath) {
 }
 
 function isMissingRemoteError(err) {
-  const status = err?.response?.status ?? err?.code;
+  // Pack manifests explicitly support recreating a missing archive. Ordinary
+  // tracked-file uploads stop instead; unwrap their error only at this caller.
+  const source = err?.code === "REMOTE_CHANGED" ? err.cause : err;
+  const status = source?.response?.status ?? source?.code;
   return status === 404 || status === "404";
 }
 
