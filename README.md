@@ -32,8 +32,6 @@ npm run install:debug # symlinks `debug_aethel` without replacing `aethel`
 
 ## Setup
 
-![Aethel setup flow](docs/setup.gif)
-
 ### 1. Get Google OAuth Credentials
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
@@ -63,8 +61,6 @@ aethel auth                    # opens browser, saves token.json
 
 ### 4. Initialize a Workspace
 
-![Aethel init flow](docs/init.gif)
-
 ```bash
 aethel clone <folder-id-or-url> ./workspace  # Git-style init + full pull
 aethel clone my-drive ./my-drive             # clone entire My Drive
@@ -78,7 +74,7 @@ aethel pull --all -m "initial pull"     # hydrate local files from the current r
 
 ## Daily Workflow
 
-![Aethel usage flow](docs/usage.gif)
+![Aethel daily sync in the terminal](docs/demo.png)
 
 Aethel is not a background mirror. It uses a Git-like flow:
 
