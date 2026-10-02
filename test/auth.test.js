@@ -42,7 +42,21 @@ test("auth command forces fresh OAuth instead of reusing cached token", () => {
   assert.match(repositorySource, /authenticate\([\s\S]*force: Boolean\(this\._options\.forceAuth\)/);
 });
 
-test("getDriveAgent keeps a bounded pool of connections warm", () => {
+const PROXY_VARS = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"];
+
+function withoutProxyEnv(t) {
+  const saved = PROXY_VARS.map((name) => [name, process.env[name]]);
+  for (const name of PROXY_VARS) delete process.env[name];
+  t.after(() => {
+    for (const [name, value] of saved) {
+      if (value !== undefined) process.env[name] = value;
+    }
+    resetDriveAgent();
+  });
+}
+
+test("getDriveAgent keeps a bounded pool of connections warm", (t) => {
+  withoutProxyEnv(t);
   resetDriveAgent();
   const agent = getDriveAgent();
 
@@ -59,7 +73,8 @@ test("getDriveAgent keeps a bounded pool of connections warm", () => {
   }
 });
 
-test("getDriveAgent sizes the pool from the concurrency settings", () => {
+test("getDriveAgent sizes the pool from the concurrency settings", (t) => {
+  withoutProxyEnv(t);
   const previous = process.env.AETHEL_DRIVE_CONCURRENCY;
   process.env.AETHEL_DRIVE_CONCURRENCY = "64";
   resetDriveAgent();
