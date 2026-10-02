@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.25 (2026-10-02)
+
+- Set the README demo image title and tabs in the Playwrite CA Guides font
+
 ## 1.3.24 (2026-10-02)
 
 - Set the README demo image tab labels in the calligraphy font
