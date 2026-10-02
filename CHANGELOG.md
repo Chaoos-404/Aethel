@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.23 (2026-10-02)
+
+- Set the README demo image title in a calligraphy font
+
 ## 1.3.22 (2026-10-02)
 
 - Link the website from the README and package homepage; give the README demo image transparent corners
