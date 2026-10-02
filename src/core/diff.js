@@ -767,7 +767,8 @@ function inferFolderRenamesFromDescendants(snapshotFiles, remoteById, remoteFold
 
     const from = oldParts.slice(0, shared + 1).join("/");
     const to = newParts.slice(0, shared + 1).join("/");
-    if (!remoteFolderPaths.has(to) || !localFolderPaths.has(from)) continue;
+    // A target that already exists locally is a move into that folder, not a rename onto it.
+    if (!remoteFolderPaths.has(to) || !localFolderPaths.has(from) || localFolderPaths.has(to)) continue;
     const key = `${from}\0${to}`;
     candidates.set(key, { from, to, matches: (candidates.get(key)?.matches || 0) + 1 });
   }
