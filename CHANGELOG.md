@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.22 (2026-10-02)
+
+- Link the website from the README and package homepage; give the README demo image transparent corners
+
 ## 1.3.21 (2026-10-02)
 
 - Add a new landing page with a live terminal demo; replace the demo GIFs and video in the README and package
