@@ -4,8 +4,11 @@
 [![npm version](https://img.shields.io/npm/v/aethel)](https://www.npmjs.com/package/aethel)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D22.12-brightgreen)](https://nodejs.org)
+[![Website](https://img.shields.io/badge/website-chaoos--404.github.io%2FAethel-0071e3)](https://chaoos-404.github.io/Aethel/)
 
 **Git-style Google Drive sync from your terminal.**
+
+[**Website**](https://chaoos-404.github.io/Aethel/) · [npm](https://www.npmjs.com/package/aethel) · [Changelog](CHANGELOG.md) · [Architecture](docs/ARCHITECTURE.md)
 
 Aethel brings a `snapshot → diff → stage → commit` workflow to Google Drive. Track changes on both sides, resolve conflicts explicitly, and keep a full sync history — all without leaving the command line. It also ships with a dual-pane TUI for hands-on file management.
 
@@ -74,7 +77,9 @@ aethel pull --all -m "initial pull"     # hydrate local files from the current r
 
 ## Daily Workflow
 
-![Aethel daily sync in the terminal](docs/demo.png)
+<p align="center"><a href="https://chaoos-404.github.io/Aethel/"><img src="docs/demo.png" alt="Aethel daily sync in the terminal" width="860"></a></p>
+
+<p align="center"><sub>Watch the animated version on the <a href="https://chaoos-404.github.io/Aethel/">website</a>.</sub></p>
 
 Aethel is not a background mirror. It uses a Git-like flow:
 
