@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.24 (2026-10-02)
+
+- Set the README demo image tab labels in the calligraphy font
+
 ## 1.3.23 (2026-10-02)
 
 - Set the README demo image title in a calligraphy font
