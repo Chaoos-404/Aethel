@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.0 (2026-10-06)
+
+- Protect unsynced local work during sync: remote folder deletions and renames no longer read as local additions, deletions from Drive and downloads refuse to destroy local files Drive does not have, and pull --all keeps locally edited files unless --force is given
+
 ## 1.3.25 (2026-10-02)
 
 - Set the README demo image title and tabs in the Playwrite CA Guides font
