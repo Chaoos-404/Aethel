@@ -1198,21 +1198,31 @@ async function downloadMediaToPath(drive, fileMeta, localPath) {
   await pipeline(response.data, writeStream);
 
   // Verify integrity if Drive provided an md5
+  const actualMd5 = md5.digest("hex");
   const expectedMd5 = fileMeta.md5Checksum;
-  if (expectedMd5) {
-    const actualMd5 = md5.digest("hex");
-    if (actualMd5 !== expectedMd5) {
-      const err = new Error(
-        `Integrity check failed for ${fileMeta.name}: ` +
-          `expected md5 ${expectedMd5}, got ${actualMd5}`
-      );
-      err.aethelIntegrityFailure = true;
-      throw err;
-    }
+  if (expectedMd5 && actualMd5 !== expectedMd5) {
+    const err = new Error(
+      `Integrity check failed for ${fileMeta.name}: ` +
+        `expected md5 ${expectedMd5}, got ${actualMd5}`
+    );
+    err.aethelIntegrityFailure = true;
+    throw err;
   }
+  return actualMd5;
 }
 
-export async function downloadFile(drive, fileMeta, localPath) {
+/**
+ * Download `fileMeta` to `localPath`, replacing whatever is there only once the
+ * new bytes are complete and verified.
+ *
+ * `guardReplace(targetPath, downloadedMd5)` lets the caller veto the
+ * replacement (by throwing) when the existing file is not safe to lose. It runs
+ * before the transfer, so a large download is not made for nothing
+ * (`downloadedMd5` is null then), and again right before the replacement,
+ * because the destination can change while the transfer runs. Google Workspace
+ * exports are derived files and are not guarded.
+ */
+export async function downloadFile(drive, fileMeta, localPath, { guardReplace = null } = {}) {
   const mime = fileMeta.mimeType || "";
   const exportInfo = EXPORT_MAP[mime];
   let targetPath = localPath;
@@ -1224,13 +1234,19 @@ export async function downloadFile(drive, fileMeta, localPath) {
     throw new Error(`Cannot download Google Workspace file '${fileMeta.name || fileMeta.id}' with unsupported mimeType '${mime}'`);
   }
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  const guarded = guardReplace && !exportInfo;
+  if (guarded) await guardReplace(targetPath, null);
   const temp = path.join(path.dirname(targetPath), `.aethel-download-${crypto.randomUUID()}`);
   try {
-    await withStreamRetry(() => exportInfo
-      ? exportToPath(drive, fileMeta, exportInfo, temp)
-      : downloadMediaToPath(drive, fileMeta, temp));
+    let downloadedMd5 = null;
+    await withStreamRetry(async () => {
+      if (exportInfo) await exportToPath(drive, fileMeta, exportInfo, temp);
+      else downloadedMd5 = await downloadMediaToPath(drive, fileMeta, temp);
+    });
     const handle = await fs.promises.open(temp, "r+");
     try { await handle.sync(); } finally { await handle.close(); }
+    // The destination may have been edited while the transfer ran.
+    if (guarded) await guardReplace(targetPath, downloadedMd5);
     // Only a completely downloaded and verified file replaces the old bytes.
     // On Windows a locked destination leaves the original intact.
     await fs.promises.rename(temp, targetPath);

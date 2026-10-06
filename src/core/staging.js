@@ -19,6 +19,12 @@ function changeToEntry(change) {
     entry.sourcePath = change.sourcePath;
   }
 
+  // Deepest ancestor Drive still has ("" for none). Local cleanup after a
+  // delete or move must not prune it or anything above it.
+  if (typeof change.retainDirectory === "string") {
+    entry.retainDirectory = change.retainDirectory;
+  }
+
   if (change.remoteMeta?.path) {
     entry.remotePath = change.remoteMeta.path;
   }
@@ -59,6 +65,13 @@ function changeToEntry(change) {
     entry.recursiveLocalDelete = true;
   }
 
+  // The user chose to replace the local file with the Drive version. The entry
+  // keeps `localMd5` as the state they chose against, so only a later edit
+  // is protected.
+  if (change.overwriteLocal) {
+    entry.overwriteLocal = true;
+  }
+
   return entry;
 }
 
@@ -85,8 +98,11 @@ export function stageChanges(root, changes) {
   return changes.length;
 }
 
-function remoteFileToDownloadEntry(remoteFile) {
+function remoteFileToDownloadEntry(remoteFile, { overwriteLocal = false, localFiles = null } = {}) {
   const remoteSize = Number(remoteFile.size);
+  const plannedLocalMd5 = overwriteLocal && !remoteFile.isFolder
+    ? localFiles?.[remoteFile.path]?.md5
+    : null;
   return {
     action: "download",
     path: remoteFile.path,
@@ -97,6 +113,8 @@ function remoteFileToDownloadEntry(remoteFile) {
     ...(remoteFile.md5Checksum ? { remoteMd5Checksum: remoteFile.md5Checksum } : {}),
     ...(Number.isFinite(remoteSize) && remoteSize > 0 ? { remoteSize } : {}),
     ...(remoteFile.isFolder ? { isFolder: true } : {}),
+    ...(overwriteLocal && !remoteFile.isFolder ? { overwriteLocal: true } : {}),
+    ...(plannedLocalMd5 ? { localMd5: plannedLocalMd5 } : {}),
   };
 }
 
@@ -118,18 +136,26 @@ export function stageRemoteFilesForDownload(root, remoteFiles) {
  * snapshot diff. `pull --all` re-downloads every current remote item, but it
  * must also preserve remote-deleted and renamed paths so committing the
  * hydration cannot silently rebase them away.
+ *
+ * By default a download never replaces a local file that has unsynced edits
+ * (the executor refuses and reports it). `pull --all --force` is the choice to
+ * replace them: pass `overwriteLocal` (with the local scan as `localFiles`) so
+ * the entries record that choice and the local state it was made against, and
+ * the executor still refuses to replace a file edited after that.
+ * See fullPullDownloadOptions().
  */
 export function stageFullRemotePull(
   root,
   remoteFiles,
   remoteDeletions = [],
-  remoteRenames = []
+  remoteRenames = [],
+  downloadOptions = {}
 ) {
   const index = readIndex(root);
   const byPath = new Map((index.staged || []).map((entry) => [entry.path, entry]));
 
   for (const remoteFile of remoteFiles) {
-    byPath.set(remoteFile.path, remoteFileToDownloadEntry(remoteFile));
+    byPath.set(remoteFile.path, remoteFileToDownloadEntry(remoteFile, downloadOptions));
   }
 
   for (const change of remoteDeletions) {
@@ -146,6 +172,16 @@ export function stageFullRemotePull(
   index.staged = [...byPath.values()];
   writeIndex(root, index);
   return remoteFiles.length + remoteDeletions.length + remoteRenames.length;
+}
+
+/**
+ * What `pull --all` records about replacing local files: nothing, unless the
+ * user passed `--force`. `local` is the scan taken when the pull was planned.
+ */
+export function fullPullDownloadOptions({ force = false, local = null } = {}) {
+  return force
+    ? { overwriteLocal: true, localFiles: local?.files ?? local }
+    : {};
 }
 
 export function unstagePath(root, targetPath) {
@@ -182,6 +218,8 @@ export function conflictResolutionChange(change, strategy) {
       suggestedAction: "download",
       shortStatus: "MR",
       description: "modified on Drive",
+      // Choosing the Drive version is choosing to replace the local file.
+      overwriteLocal: true,
     };
   }
 
@@ -241,6 +279,8 @@ export function stageConflictResolution(root, change, strategy) {
       remotePath: change.remoteMeta?.path || change.path,
       remoteMimeType: change.remoteMeta?.mimeType,
       remoteMd5Checksum: change.remoteMeta?.md5Checksum,
+      // A copy Aethel made on an earlier resolve is replaced, not protected.
+      overwriteLocal: true,
     });
 
     // Stage upload of local version

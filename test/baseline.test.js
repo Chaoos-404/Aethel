@@ -103,3 +103,59 @@ test("a rename retains its ID when the download was staged before the old-path d
   assert.equal(next.remote[0].path, "new.txt");
   assert.equal(next.local.files["old.txt"], undefined);
 });
+
+// The local scan records every folder of an all-empty branch. Once a move or a
+// deletion has taken the leaf away, the emptied parents are gone from Drive and
+// from disk; a lingering baseline entry for one would later read as a local
+// deletion of whatever Drive next puts at that path.
+
+function folderPair(parent, child) {
+  return {
+    files: { sub: { id: "sub", path: child, localPath: child, isFolder: true } },
+    localFiles: {
+      [parent]: { localPath: parent, isFolder: true },
+      [child]: { localPath: child, isFolder: true },
+    },
+  };
+}
+
+test("a folder move forgets the emptied parent folder that is gone from disk", () => {
+  const next = advanceBaseline(
+    folderPair("docs", "docs/sub"),
+    [{ id: "sub", path: "archive/sub", isFolder: true }],
+    { files: {
+      archive: { localPath: "archive", isFolder: true },
+      "archive/sub": { localPath: "archive/sub", isFolder: true },
+    } },
+    [{ action: "move_local", path: "archive/sub", sourcePath: "docs/sub", fileId: "sub" }]
+  );
+
+  assert.equal(next.local.files.docs, undefined);
+  assert.ok(next.local.files["archive/sub"]);
+});
+
+test("a folder move keeps the parent folder entry while the parent still exists on disk", () => {
+  const next = advanceBaseline(
+    folderPair("docs", "docs/sub"),
+    [{ id: "sub", path: "archive/sub", isFolder: true }],
+    { files: {
+      docs: { localPath: "docs", isFolder: true },
+      "archive/sub": { localPath: "archive/sub", isFolder: true },
+    } },
+    [{ action: "move_local", path: "archive/sub", sourcePath: "docs/sub", fileId: "sub" }]
+  );
+
+  assert.ok(next.local.files.docs);
+});
+
+test("a local folder deletion forgets the emptied parent folder that is gone from disk", () => {
+  const next = advanceBaseline(
+    folderPair("docs", "docs/sub"),
+    [],
+    { files: {} },
+    [{ action: "delete_local", path: "docs/sub", fileId: "sub" }]
+  );
+
+  assert.deepEqual(next.local.files, {});
+  assert.deepEqual(next.remote, []);
+});

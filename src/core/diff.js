@@ -79,6 +79,7 @@ function createChange({
   localMeta = null,
   snapshotMeta = null,
   sourcePath = null,
+  retainDirectory = null,
 }) {
   return {
     changeType,
@@ -88,6 +89,8 @@ function createChange({
     localMeta,
     snapshotMeta,
     ...(sourcePath ? { sourcePath } : {}),
+    // "" is meaningful (no ancestor survives on Drive), so test the type.
+    ...(typeof retainDirectory === "string" ? { retainDirectory } : {}),
     shortStatus: SHORT_STATUS[changeType],
     description: DESCRIPTION[changeType],
     suggestedAction: SUGGESTED_ACTION[changeType],
@@ -709,14 +712,21 @@ function locallyDeletedAncestorPath(pathValue, snapshotLocalIndex, currentLocalI
   return null;
 }
 
-function remotelyDeletedAncestorPath(pathValue, snapshotRemoteIndex, currentRemoteIndex, localFolderPaths) {
+function remotelyDeletedAncestorPath(
+  pathValue,
+  snapshotRemoteIndex,
+  currentRemoteIndex,
+  localFolderPaths,
+  canCollapseInto = null
+) {
   const parts = String(pathValue || "").split("/").filter(Boolean);
   for (let i = 1; i < parts.length; i++) {
     const candidate = parts.slice(0, i).join("/");
     if (
       localFolderPaths.has(candidate) &&
       hasPathOrDescendant(snapshotRemoteIndex, candidate) &&
-      !hasPathOrDescendant(currentRemoteIndex, candidate)
+      !hasPathOrDescendant(currentRemoteIndex, candidate) &&
+      (!canCollapseInto || canCollapseInto(candidate))
     ) {
       return candidate;
     }
@@ -907,6 +917,35 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
   }
   const remoteById = new Map(remoteFiles.map((file) => [file.id, file]));
 
+  // Applying a remote delete or move can leave the old parent directories
+  // empty locally. Only the ones Drive no longer has may be pruned: Drive keeps
+  // empty folders, so the local copy must too. This is the deepest ancestor of
+  // `pathValue` that still exists on Drive ("" when none does).
+  const deepestRemoteAncestor = (pathValue) => {
+    let slashIndex = pathValue.lastIndexOf("/");
+    while (slashIndex > 0) {
+      const ancestor = pathValue.slice(0, slashIndex);
+      if (remoteFolderPaths.has(ancestor)) return ancestor;
+      slashIndex = pathValue.lastIndexOf("/", slashIndex - 1);
+    }
+    return "";
+  };
+
+  // A folder-level remote deletion removes the whole local tree, so it may only
+  // be proposed for a folder whose local files Drive already has as they are
+  // now. A file is unsynced when Drive never knew its path or its bytes differ
+  // from the baseline (added or edited locally): deleting it would destroy work
+  // that exists nowhere else.
+  const foldersHoldingUnsyncedLocalFiles = collectFolderPaths(
+    Object.entries(localFilesData)
+      .filter(([pathValue, meta]) => {
+        if (meta.isFolder) return false;
+        const baseline = snapshotLocalFiles[pathValue];
+        return !snapshotRemoteByPath.has(pathValue) || !baseline || baseline.md5 !== meta.md5;
+      })
+      .map(([pathValue]) => pathValue)
+  );
+
   // A folder keeps its Drive ID when renamed.  Recognize the top-level folder
   // rename before comparing descendants by path, so its existing local tree is
   // moved intact instead of being deleted and downloaded one file at a time.
@@ -1065,6 +1104,7 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
         path: rename.to,
         sourcePath: rename.from,
         snapshotMeta: folderSnapshotMeta(rename.from, snapshotRemoteByPath),
+        retainDirectory: deepestRemoteAncestor(rename.from),
       })
     );
   }
@@ -1108,6 +1148,7 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
           fileId: remoteFile.id,
           remoteMeta: remoteFile,
           snapshotMeta: snapshotEntry,
+          retainDirectory: deepestRemoteAncestor(renamedFolder.from),
         })
       );
       continue;
@@ -1389,13 +1430,24 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
         continue;
       }
 
+      // An empty folder deleted on Drive may have been filled locally since.
+      // That work is a local addition that re-creates the folder, not
+      // something the deletion may take with it.
+      if (snapshotEntry.isFolder && foldersHoldingUnsyncedLocalFiles.has(snapshotPath)) {
+        continue;
+      }
+
+      // Collapse to the topmost folder Drive lost, unless local work lives in
+      // it; the files that Drive had are then deleted one by one and the rest
+      // stays as local additions or conflicts.
       const remoteDeletePath = snapshotEntry.isFolder
         ? null
         : remotelyDeletedAncestorPath(
           snapshotPath,
           snapshotRemoteIndex,
           currentRemoteIndex,
-          localFolderPaths
+          localFolderPaths,
+          (candidate) => !foldersHoldingUnsyncedLocalFiles.has(candidate)
         );
       if (remoteDeletePath) {
         remoteDeletedFoldersByPath.add(remoteDeletePath);
@@ -1406,6 +1458,7 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
             path: remoteDeletePath,
             fileId: remoteFolder?.fileId || null,
             snapshotMeta: folderSnapshotMeta(remoteDeletePath, snapshotRemoteByPath),
+            retainDirectory: deepestRemoteAncestor(remoteDeletePath),
           })
         );
         continue;
@@ -1421,6 +1474,7 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
           path: snapshotPath,
           fileId,
           snapshotMeta: snapshotEntry,
+          retainDirectory: deepestRemoteAncestor(snapshotPath),
         })
       );
     }
@@ -1506,6 +1560,15 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
    */
   const neverReachedRemote = (relativePath, localMeta) => {
     if (snapshotRemoteByPath.has(relativePath)) return false;
+
+    // The local scan records every folder of an all-empty branch, while Drive
+    // lists only its leaf. A folder the baseline knew on Drive as an ancestor
+    // of such a leaf did reach Drive: once the leaf is deleted or renamed away
+    // the folder is gone from Drive too, which is a remote change to apply and
+    // not a folder the user created.
+    if (localMeta.isFolder && hasPathOrDescendant(snapshotRemoteIndex, relativePath)) {
+      return false;
+    }
 
     const remoteRenameAdjustedPath = applyLocalFolderRenames(
       relativePath,

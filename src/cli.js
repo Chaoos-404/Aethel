@@ -1010,7 +1010,7 @@ async function handleFetch(options) {
 
 async function handlePull(paths, options) {
   const { ChangeType } = await loadDiffModule();
-  const { conflictResolutionChange } = await loadStagingModule();
+  const { conflictResolutionChange, fullPullDownloadOptions } = await loadStagingModule();
   const debug = createDebugLogger(options);
   debug("pull start", {
     force: Boolean(options.force),
@@ -1018,7 +1018,7 @@ async function handlePull(paths, options) {
     paths: paths?.length || 0,
   });
   const repo = await openRepo(options);
-  const { diff, remoteState } = await loadStateWithProgress(repo, {
+  const { diff, remoteState, local } = await loadStateWithProgress(repo, {
     useCache: remoteCacheEnabledByDefault("pull"),
   });
   if (options.nonInteractive && diff.conflicts.length && !options.force) process.exitCode = 2;
@@ -1076,10 +1076,22 @@ async function handlePull(paths, options) {
       for (const change of remoteRenames) {
         console.log(`  ${change.shortStatus} ${change.path}  (${change.description})`);
       }
+      if (!options.force) {
+        console.log("Local files with unsynced edits are kept; use --force to replace them.");
+      }
       return;
     }
 
-    const count = repo.stageFullRemotePull(remoteFiles, remoteDeletions, remoteRenames);
+    // A full pull does not replace local files that have unsynced edits: those
+    // downloads are refused and reported. `--force` is the choice to replace
+    // them; it records the local state it was made against, so an edit made
+    // after this point, while the transfers run, is still not overwritten.
+    const count = repo.stageFullRemotePull(
+      remoteFiles,
+      remoteDeletions,
+      remoteRenames,
+      fullPullDownloadOptions({ force: options.force, local })
+    );
     console.log(`Staged ${count} remote change(s). Committing...`);
     await handleCommit({ ...options, message: options.message || "pull" }, {
       repo,
@@ -1991,9 +2003,9 @@ async function main() {
       .command("pull")
       .description("Download remote changes")
       .argument("[paths...]", "Specific paths to pull (default: all)")
-      .option("--all", "Download all remote files regardless of snapshot state")
+      .option("--all", "Download all remote files regardless of snapshot state (files with unsynced local edits are kept unless --force)")
       .option("-m, --message <message>", "Commit message")
-      .option("--force", "Force-pull conflicts (remote wins)")
+      .option("--force", "Remote wins: take the Drive version of conflicts, and with --all replace locally edited files")
       .option("--dry-run", "Preview changes without applying")
       .option("--dry-run-limit <number>", "Limit dry-run preview entries")
       .option("--debug", "Show debug timings on stderr")

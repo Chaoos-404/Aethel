@@ -1751,3 +1751,233 @@ test("computeDiff still stages a deletion for a file that exists on Drive", () =
   assert.equal(change.path, "Library");
   assert.equal(change.suggestedAction, "delete_remote");
 });
+
+// Drive lists a folder only while it is empty, whereas the local scan records
+// every folder of an all-empty branch. These cover how that mismatch must not
+// turn a remote deletion or rename into a local addition.
+
+test("computeDiff does not read the emptied parent of a remotely deleted folder as a new local folder", () => {
+  const snapshot = {
+    files: {
+      sub: { id: "sub", path: "docs/sub", localPath: "docs/sub", isFolder: true },
+    },
+    localFiles: {
+      docs: { localPath: "docs", isFolder: true },
+      "docs/sub": { localPath: "docs/sub", isFolder: true },
+    },
+  };
+  const localFiles = {
+    docs: { localPath: "docs", isFolder: true },
+    "docs/sub": { localPath: "docs/sub", isFolder: true },
+  };
+
+  const diff = computeDiff(snapshot, [], localFiles);
+
+  assert.deepEqual(
+    diff.changes.map((c) => ({ type: c.changeType, path: c.path })),
+    [{ type: ChangeType.REMOTE_DELETED, path: "docs/sub" }]
+  );
+  // Nothing of `docs` survives on Drive, so local cleanup may prune it.
+  assert.equal(diff.changes[0].retainDirectory, "");
+});
+
+test("computeDiff does not read the old parent of a remotely renamed folder as a new local folder", () => {
+  const snapshot = {
+    files: {
+      sub: { id: "sub", path: "docs/sub", localPath: "docs/sub", isFolder: true },
+    },
+    localFiles: {
+      docs: { localPath: "docs", isFolder: true },
+      "docs/sub": { localPath: "docs/sub", isFolder: true },
+    },
+  };
+  const remoteFiles = [
+    { id: "sub", path: "archive/sub", isFolder: true, mimeType: "application/vnd.google-apps.folder" },
+  ];
+  const localFiles = {
+    docs: { localPath: "docs", isFolder: true },
+    "docs/sub": { localPath: "docs/sub", isFolder: true },
+  };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+
+  assert.deepEqual(
+    diff.changes.map((c) => ({ type: c.changeType, path: c.path, from: c.sourcePath })),
+    [{ type: ChangeType.REMOTE_RENAMED, path: "archive/sub", from: "docs/sub" }]
+  );
+  assert.equal(diff.changes[0].retainDirectory, "");
+});
+
+test("computeDiff still reports a baseline folder that never existed on Drive as a local addition", () => {
+  // Only a folder the baseline knew on Drive (as a leaf or as the parent of
+  // one) counts as having reached it. A folder recorded locally alone has not.
+  const snapshot = {
+    files: {
+      keep: { id: "keep", path: "keep.txt", localPath: "keep.txt", md5Checksum: "keep-md5" },
+    },
+    localFiles: {
+      "keep.txt": { localPath: "keep.txt", md5: "keep-md5" },
+      scratch: { localPath: "scratch", isFolder: true },
+    },
+  };
+  const remoteFiles = [{ id: "keep", path: "keep.txt", md5Checksum: "keep-md5" }];
+  const localFiles = {
+    "keep.txt": { localPath: "keep.txt", md5: "keep-md5" },
+    scratch: { localPath: "scratch", isFolder: true },
+  };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+
+  assert.deepEqual(
+    diff.changes.map((c) => ({ type: c.changeType, path: c.path })),
+    [{ type: ChangeType.LOCAL_ADDED, path: "scratch" }]
+  );
+});
+
+// A folder-level remote deletion removes the whole local tree, so it must not be
+// proposed for a folder that holds local work Drive does not have.
+
+function remotelyDeletedTree({ extraLocal = {}, edited = {} } = {}) {
+  const tracked = {
+    "docs/a.txt": "a-md5",
+    "docs/sub/b.txt": "b-md5",
+  };
+  const snapshot = {
+    files: Object.fromEntries(
+      Object.entries(tracked).map(([filePath, md5]) => [
+        `id:${filePath}`,
+        { id: `id:${filePath}`, path: filePath, localPath: filePath, md5Checksum: md5 },
+      ])
+    ),
+    localFiles: Object.fromEntries(
+      Object.entries(tracked).map(([filePath, md5]) => [filePath, { localPath: filePath, md5 }])
+    ),
+  };
+  const localFiles = Object.fromEntries(
+    Object.entries({ ...tracked, ...edited }).map(([filePath, md5]) => [filePath, { localPath: filePath, md5 }])
+  );
+  for (const [filePath, md5] of Object.entries(extraLocal)) {
+    localFiles[filePath] = { localPath: filePath, md5 };
+  }
+  return computeDiff(snapshot, [], localFiles);
+}
+
+test("computeDiff collapses a remotely deleted folder when every local file matches the baseline", () => {
+  const diff = remotelyDeletedTree();
+
+  assert.deepEqual(
+    diff.changes.map((change) => ({ type: change.changeType, path: change.path })),
+    [{ type: ChangeType.REMOTE_DELETED, path: "docs" }]
+  );
+});
+
+test("computeDiff does not collapse a remotely deleted folder that holds an unsynced local file", () => {
+  const diff = remotelyDeletedTree({ extraLocal: { "docs/new.txt": "new-md5" } });
+
+  // docs holds new work, so it is never named; docs/sub holds none and is
+  // still deleted as a whole.
+  assert.deepEqual(
+    diff.changes.map((change) => `${change.changeType} ${change.path}`).sort(),
+    [
+      `${ChangeType.LOCAL_ADDED} docs/new.txt`,
+      `${ChangeType.REMOTE_DELETED} docs/a.txt`,
+      `${ChangeType.REMOTE_DELETED} docs/sub`,
+    ].sort()
+  );
+});
+
+test("computeDiff falls back to file-level deletions at every level that holds local work", () => {
+  const diff = remotelyDeletedTree({ extraLocal: { "docs/sub/new.txt": "new-md5" } });
+
+  assert.deepEqual(
+    diff.changes.map((change) => `${change.changeType} ${change.path}`).sort(),
+    [
+      `${ChangeType.LOCAL_ADDED} docs/sub/new.txt`,
+      `${ChangeType.REMOTE_DELETED} docs/a.txt`,
+      `${ChangeType.REMOTE_DELETED} docs/sub/b.txt`,
+    ].sort()
+  );
+});
+
+test("computeDiff reports a conflict instead of deleting a locally edited file in a remotely deleted folder", () => {
+  const diff = remotelyDeletedTree({ edited: { "docs/a.txt": "edited-md5" } });
+
+  assert.deepEqual(diff.conflicts.map((change) => change.path), ["docs/a.txt"]);
+  assert.equal(
+    diff.changes.some((change) => change.changeType === ChangeType.REMOTE_DELETED && change.path === "docs"),
+    false
+  );
+});
+
+test("computeDiff does not delete a remotely deleted empty folder that was filled locally", () => {
+  // The baseline has no local folder entry here (older snapshots recorded
+  // folders only when empty), so nothing else would stop the recursive delete.
+  const snapshot = {
+    files: { x: { id: "x", path: "x", localPath: "x", isFolder: true } },
+    localFiles: {},
+  };
+  const localFiles = { "x/new.txt": { localPath: "x/new.txt", md5: "new-md5" } };
+
+  const diff = computeDiff(snapshot, [], localFiles);
+
+  assert.deepEqual(
+    diff.changes.map((change) => `${change.changeType} ${change.path}`),
+    [`${ChangeType.LOCAL_ADDED} x/new.txt`]
+  );
+});
+
+test("computeDiff treats a file recorded locally but never on Drive as unsynced work", () => {
+  const snapshot = {
+    files: { a: { id: "a", path: "docs/a.txt", localPath: "docs/a.txt", md5Checksum: "a-md5" } },
+    localFiles: {
+      "docs/a.txt": { localPath: "docs/a.txt", md5: "a-md5" },
+      "docs/draft.txt": { localPath: "docs/draft.txt", md5: "draft-md5" },
+    },
+  };
+  const localFiles = {
+    "docs/a.txt": { localPath: "docs/a.txt", md5: "a-md5" },
+    "docs/draft.txt": { localPath: "docs/draft.txt", md5: "draft-md5" },
+  };
+
+  const diff = computeDiff(snapshot, [], localFiles);
+
+  assert.equal(
+    diff.changes.some((change) => change.changeType === ChangeType.REMOTE_DELETED && change.path === "docs"),
+    false
+  );
+  assert.ok(diff.changes.some((change) => change.changeType === ChangeType.REMOTE_DELETED && change.path === "docs/a.txt"));
+});
+
+test("computeDiff tells local cleanup which ancestor a remotely deleted file leaves on Drive", () => {
+  // Deleting the last file of docs/sub leaves docs/sub on Drive as an empty
+  // folder, so the local copy of it must survive the deletion.
+  const snapshot = {
+    files: {
+      b: { id: "b", path: "docs/b.txt", localPath: "docs/b.txt", md5Checksum: "b-md5" },
+      x: { id: "x", path: "docs/sub/x.txt", localPath: "docs/sub/x.txt", md5Checksum: "x-md5" },
+    },
+    localFiles: {
+      "docs/b.txt": { localPath: "docs/b.txt", md5: "b-md5" },
+      "docs/sub/x.txt": { localPath: "docs/sub/x.txt", md5: "x-md5" },
+    },
+  };
+  const remoteFiles = [
+    { id: "b", path: "docs/b.txt", md5Checksum: "b-md5" },
+    { id: "sub", path: "docs/sub", isFolder: true, mimeType: "application/vnd.google-apps.folder" },
+  ];
+  const localFiles = {
+    "docs/b.txt": { localPath: "docs/b.txt", md5: "b-md5" },
+    "docs/sub/x.txt": { localPath: "docs/sub/x.txt", md5: "x-md5" },
+  };
+
+  const diff = computeDiff(snapshot, remoteFiles, localFiles);
+
+  assert.deepEqual(
+    diff.changes.map((c) => ({
+      type: c.changeType,
+      path: c.path,
+      retainDirectory: c.retainDirectory,
+    })),
+    [{ type: ChangeType.REMOTE_DELETED, path: "docs/sub/x.txt", retainDirectory: "docs/sub" }]
+  );
+});

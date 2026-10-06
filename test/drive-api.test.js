@@ -970,6 +970,612 @@ test("executeStaged cleans empty parent folders after file-only local deletions"
   }
 });
 
+// A remote delete or move can leave the old parent directories empty. Drive
+// keeps empty folders, so only the parents Drive no longer has may be pruned;
+// `retainDirectory` names the deepest ancestor Drive still has ("" for none).
+
+async function runStagedLocalOps(t, directories, files, staged) {
+  const workspaceRoot = createTempDirectory(t, "aethel-prune-");
+  initWorkspace(workspaceRoot, null, "My Drive");
+  for (const directory of directories) {
+    await fs.mkdir(path.join(workspaceRoot, directory), { recursive: true });
+  }
+  for (const filePath of files) {
+    await fs.writeFile(path.join(workspaceRoot, filePath), "x");
+  }
+  writeIndex(workspaceRoot, { staged });
+  const result = await executeStaged({ files: {} }, workspaceRoot);
+  assert.deepEqual(result.errors, []);
+  const exists = (relativePath) => fsNative.existsSync(path.join(workspaceRoot, relativePath));
+  return { result, exists, workspaceRoot };
+}
+
+test("executeStaged prunes the parents of a deleted folder that Drive no longer has", async (t) => {
+  const { exists } = await runStagedLocalOps(t, ["docs/sub"], [], [
+    { action: "delete_local", path: "docs/sub", localPath: "docs/sub", isFolder: true, retainDirectory: "" },
+  ]);
+
+  assert.equal(exists("docs/sub"), false);
+  assert.equal(exists("docs"), false);
+});
+
+test("executeStaged stops pruning at the ancestor Drive still has", async (t) => {
+  const { exists } = await runStagedLocalOps(t, ["docs/a/b"], [], [
+    { action: "delete_local", path: "docs/a/b", localPath: "docs/a/b", isFolder: true, retainDirectory: "docs" },
+  ]);
+
+  assert.equal(exists("docs/a"), false);
+  assert.equal(exists("docs"), true);
+});
+
+test("executeStaged never prunes a parent that still holds local content", async (t) => {
+  const { exists } = await runStagedLocalOps(t, ["docs/sub"], ["docs/mine.txt"], [
+    { action: "delete_local", path: "docs/sub", localPath: "docs/sub", isFolder: true, retainDirectory: "" },
+  ]);
+
+  assert.equal(exists("docs/mine.txt"), true);
+});
+
+test("executeStaged keeps the emptied folder Drive still has after its last file is deleted", async (t) => {
+  const { exists } = await runStagedLocalOps(t, ["docs/sub"], ["docs/sub/x.txt"], [
+    { action: "delete_local", path: "docs/sub/x.txt", localPath: "docs/sub/x.txt", retainDirectory: "docs/sub" },
+  ]);
+
+  assert.equal(exists("docs/sub/x.txt"), false);
+  assert.equal(exists("docs/sub"), true);
+});
+
+test("executeStaged still prunes every empty parent of a deleted file when no ancestor is retained", async (t) => {
+  const { exists } = await runStagedLocalOps(t, ["docs/sub"], ["docs/sub/x.txt"], [
+    { action: "delete_local", path: "docs/sub/x.txt", localPath: "docs/sub/x.txt", retainDirectory: "" },
+  ]);
+
+  assert.equal(exists("docs"), false);
+});
+
+test("executeStaged leaves the parents of a folder delete alone when the entry names no retained ancestor", async (t) => {
+  // Entries staged before the hint existed keep their previous behaviour.
+  const { exists } = await runStagedLocalOps(t, ["docs/sub"], [], [
+    { action: "delete_local", path: "docs/sub", localPath: "docs/sub", isFolder: true },
+  ]);
+
+  assert.equal(exists("docs/sub"), false);
+  assert.equal(exists("docs"), true);
+});
+
+test("executeStaged prunes the old parents of a moved folder that Drive no longer has", async (t) => {
+  const { exists } = await runStagedLocalOps(t, ["docs/sub"], ["docs/sub/x.txt"], [
+    { action: "move_local", path: "archive/sub", localPath: "archive/sub", sourcePath: "docs/sub", retainDirectory: "" },
+  ]);
+
+  assert.equal(exists("archive/sub/x.txt"), true);
+  assert.equal(exists("docs"), false);
+});
+
+test("executeStaged keeps the old parent of a moved folder when Drive still has it", async (t) => {
+  const { exists } = await runStagedLocalOps(t, ["docs/sub"], ["docs/sub/x.txt"], [
+    { action: "move_local", path: "archive/sub", localPath: "archive/sub", sourcePath: "docs/sub", retainDirectory: "docs" },
+  ]);
+
+  assert.equal(exists("archive/sub/x.txt"), true);
+  assert.equal(exists("docs"), true);
+});
+
+// A recursive delete removes every local file under the folder. It is checked
+// against the baseline right before it runs, because staged entries outlive the
+// plan that made them and files appear in between.
+
+async function stageRecursiveFolderDelete(t, { baselineFiles, localFiles, ignore = null }) {
+  const workspaceRoot = createTempDirectory(t, "aethel-recursive-");
+  initWorkspace(workspaceRoot, null, "My Drive");
+  const files = {};
+  const baselineLocal = {};
+  for (const [relativePath, content] of Object.entries(baselineFiles)) {
+    files[`id:${relativePath}`] = {
+      id: `id:${relativePath}`,
+      path: relativePath,
+      localPath: relativePath,
+      md5Checksum: md5(Buffer.from(content)),
+    };
+    baselineLocal[relativePath] = { localPath: relativePath, md5: md5(Buffer.from(content)) };
+  }
+  writeSnapshot(workspaceRoot, {
+    timestamp: "2026-10-01T00:00:00.000Z",
+    message: "baseline",
+    files,
+    localFiles: baselineLocal,
+  });
+  if (ignore) await fs.writeFile(path.join(workspaceRoot, ".aethelignore"), ignore);
+  for (const [relativePath, content] of Object.entries(localFiles)) {
+    const absolutePath = path.join(workspaceRoot, ...relativePath.split("/"));
+    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+    await fs.writeFile(absolutePath, content);
+  }
+  writeIndex(workspaceRoot, {
+    staged: [{
+      action: "delete_local",
+      path: "docs",
+      localPath: "docs",
+      isFolder: true,
+      recursiveLocalDelete: true,
+    }],
+  });
+  const result = await executeStaged({ files: {} }, workspaceRoot);
+  const exists = (relativePath) => fsNative.existsSync(path.join(workspaceRoot, relativePath));
+  return { result, exists, workspaceRoot };
+}
+
+test("executeStaged deletes a folder tree whose local files all match the baseline", async (t) => {
+  const { result, exists, workspaceRoot } = await stageRecursiveFolderDelete(t, {
+    baselineFiles: { "docs/a.txt": "a", "docs/sub/b.txt": "b" },
+    localFiles: { "docs/a.txt": "a", "docs/sub/b.txt": "b" },
+  });
+
+  assert.deepEqual(result.errors, []);
+  assert.equal(exists("docs"), false);
+  assert.equal(readIndex(workspaceRoot).staged.length, 0);
+});
+
+test("executeStaged refuses a recursive delete that would destroy a local file Drive never had", async (t) => {
+  const { result, exists, workspaceRoot } = await stageRecursiveFolderDelete(t, {
+    baselineFiles: { "docs/a.txt": "a" },
+    localFiles: { "docs/a.txt": "a", "docs/new.txt": "unsynced work" },
+  });
+
+  assert.equal(result.deletedLocal, 0);
+  assert.equal(result.errors.length, 1);
+  assert.match(result.errors[0], /Refusing to delete docs.*docs\/new\.txt/);
+  assert.equal(exists("docs/new.txt"), true);
+  assert.equal(exists("docs/a.txt"), true, "nothing is removed when the folder is refused");
+  assert.equal(readIndex(workspaceRoot).staged.length, 1, "the refused entry stays staged");
+});
+
+test("executeStaged refuses a recursive delete that would destroy a local edit", async (t) => {
+  const { result, exists } = await stageRecursiveFolderDelete(t, {
+    baselineFiles: { "docs/a.txt": "a" },
+    localFiles: { "docs/a.txt": "edited since the baseline" },
+  });
+
+  assert.equal(result.errors.length, 1);
+  assert.match(result.errors[0], /Refusing to delete docs.*docs\/a\.txt/);
+  assert.equal(exists("docs/a.txt"), true);
+});
+
+test("executeStaged refuses a file that is in the local baseline but was never on Drive", async (t) => {
+  // The baseline records scanned files whether or not they uploaded, so it is
+  // the Drive-side record that says Drive has the file.
+  const workspaceRoot = createTempDirectory(t, "aethel-recursive-");
+  initWorkspace(workspaceRoot, null, "My Drive");
+  writeSnapshot(workspaceRoot, {
+    timestamp: "2026-10-01T00:00:00.000Z",
+    message: "baseline",
+    files: {
+      a: { id: "a", path: "docs/a.txt", localPath: "docs/a.txt", md5Checksum: md5(Buffer.from("a")) },
+    },
+    localFiles: {
+      "docs/a.txt": { localPath: "docs/a.txt", md5: md5(Buffer.from("a")) },
+      "docs/draft.txt": { localPath: "docs/draft.txt", md5: md5(Buffer.from("draft")) },
+    },
+  });
+  await fs.mkdir(path.join(workspaceRoot, "docs"), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, "docs", "a.txt"), "a");
+  await fs.writeFile(path.join(workspaceRoot, "docs", "draft.txt"), "draft");
+  writeIndex(workspaceRoot, {
+    staged: [{ action: "delete_local", path: "docs", localPath: "docs", isFolder: true, recursiveLocalDelete: true }],
+  });
+
+  const result = await executeStaged({ files: {} }, workspaceRoot);
+
+  assert.match(result.errors[0], /docs\/draft\.txt/);
+  assert.equal(fsNative.existsSync(path.join(workspaceRoot, "docs", "draft.txt")), true);
+});
+
+test("executeStaged lists only a few of many files at risk", async (t) => {
+  const localFiles = Object.fromEntries(
+    Array.from({ length: 8 }, (_, index) => [`docs/new-${index}.txt`, "work"])
+  );
+  const { result } = await stageRecursiveFolderDelete(t, {
+    baselineFiles: { "docs/a.txt": "a" },
+    localFiles: { "docs/a.txt": "a", ...localFiles },
+  });
+
+  assert.match(result.errors[0], /\(\+3 more\)/);
+});
+
+test("executeStaged still deletes ignored files together with the folder", async (t) => {
+  const { result, exists } = await stageRecursiveFolderDelete(t, {
+    baselineFiles: { "docs/a.txt": "a" },
+    localFiles: { "docs/a.txt": "a", "docs/debug.log": "ignored noise" },
+    ignore: "*.log\n",
+  });
+
+  assert.deepEqual(result.errors, []);
+  assert.equal(exists("docs"), false);
+});
+
+// The same holds for deleting a single file: it may only go if Drive has it and
+// it is unchanged since the last sync.
+
+async function runStagedFileDeletes(t, {
+  baselineFiles,
+  driveKnows = Object.keys(baselineFiles),
+  statInBaseline = false,
+  localFiles,
+  staged,
+}) {
+  const workspaceRoot = createTempDirectory(t, "aethel-file-delete-");
+  initWorkspace(workspaceRoot, null, "My Drive");
+  for (const [relativePath, content] of Object.entries(localFiles)) {
+    const absolutePath = path.join(workspaceRoot, ...relativePath.split("/"));
+    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+    await fs.writeFile(absolutePath, content);
+  }
+  const files = {};
+  const baselineLocal = {};
+  for (const [relativePath, content] of Object.entries(baselineFiles)) {
+    const digest = md5(Buffer.from(content));
+    baselineLocal[relativePath] = { localPath: relativePath, md5: digest };
+    if (statInBaseline) {
+      const stat = await fs.stat(path.join(workspaceRoot, ...relativePath.split("/")));
+      Object.assign(baselineLocal[relativePath], {
+        size: stat.size,
+        modifiedTime: new Date(stat.mtimeMs).toISOString(),
+      });
+    }
+    if (driveKnows.includes(relativePath)) {
+      files[`id:${relativePath}`] = {
+        id: `id:${relativePath}`,
+        path: relativePath,
+        localPath: relativePath,
+        md5Checksum: digest,
+      };
+    }
+  }
+  writeSnapshot(workspaceRoot, {
+    timestamp: "2026-10-01T00:00:00.000Z",
+    message: "baseline",
+    files,
+    localFiles: baselineLocal,
+  });
+  writeIndex(workspaceRoot, { staged });
+  const result = await executeStaged({ files: {} }, workspaceRoot);
+  const exists = (relativePath) => fsNative.existsSync(path.join(workspaceRoot, relativePath));
+  const read = (relativePath) => fsNative.readFileSync(path.join(workspaceRoot, relativePath), "utf8");
+  return { result, exists, read, workspaceRoot };
+}
+
+const deleteFile = (relativePath, extra = {}) => ({
+  action: "delete_local",
+  path: relativePath,
+  localPath: relativePath,
+  ...extra,
+});
+
+test("executeStaged deletes a file that is unchanged since the last sync", async (t) => {
+  const { result, exists, workspaceRoot } = await runStagedFileDeletes(t, {
+    baselineFiles: { "docs/a.txt": "a" },
+    localFiles: { "docs/a.txt": "a" },
+    staged: [deleteFile("docs/a.txt")],
+  });
+
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.deletedLocal, 1);
+  assert.equal(exists("docs/a.txt"), false);
+  assert.equal(readIndex(workspaceRoot).staged.length, 0);
+});
+
+test("executeStaged refuses to delete a file edited since the last sync", async (t) => {
+  const { result, exists, read, workspaceRoot } = await runStagedFileDeletes(t, {
+    baselineFiles: { "docs/a.txt": "a" },
+    localFiles: { "docs/a.txt": "an edit made after planning" },
+    staged: [deleteFile("docs/a.txt")],
+  });
+
+  assert.equal(result.deletedLocal, 0);
+  assert.equal(result.errors.length, 1);
+  assert.match(result.errors[0], /Refusing to delete docs\/a\.txt: it changed locally/);
+  assert.equal(exists("docs/a.txt"), true);
+  assert.equal(read("docs/a.txt"), "an edit made after planning");
+  assert.equal(readIndex(workspaceRoot).staged.length, 1, "the refused entry stays staged");
+});
+
+test("executeStaged catches an edit that leaves the file the same size", async (t) => {
+  const { result, read } = await runStagedFileDeletes(t, {
+    baselineFiles: { "a.txt": "a" },
+    localFiles: { "a.txt": "b" },
+    staged: [deleteFile("a.txt")],
+  });
+
+  assert.match(result.errors[0], /changed locally/);
+  assert.equal(read("a.txt"), "b");
+});
+
+test("executeStaged refuses to delete a file Drive has no record of", async (t) => {
+  const { result, exists } = await runStagedFileDeletes(t, {
+    baselineFiles: {},
+    localFiles: { "docs/mine.txt": "never uploaded" },
+    staged: [deleteFile("docs/mine.txt")],
+  });
+
+  assert.match(result.errors[0], /Refusing to delete docs\/mine\.txt: Drive has no record of this file/);
+  assert.equal(exists("docs/mine.txt"), true);
+});
+
+test("executeStaged refuses a file in the local baseline that never reached Drive", async (t) => {
+  // The baseline records scanned files whether or not they uploaded.
+  const { result, exists } = await runStagedFileDeletes(t, {
+    baselineFiles: { "draft.txt": "draft" },
+    driveKnows: [],
+    localFiles: { "draft.txt": "draft" },
+    staged: [deleteFile("draft.txt")],
+  });
+
+  assert.match(result.errors[0], /Drive has no record of this file/);
+  assert.equal(exists("draft.txt"), true);
+});
+
+test("executeStaged deletes the files it may and keeps the edited one next to them", async (t) => {
+  const { result, exists, read } = await runStagedFileDeletes(t, {
+    baselineFiles: { "docs/a.txt": "a", "docs/b.txt": "b" },
+    localFiles: { "docs/a.txt": "a", "docs/b.txt": "edited" },
+    staged: [deleteFile("docs/a.txt"), deleteFile("docs/b.txt")],
+  });
+
+  assert.equal(result.deletedLocal, 1);
+  assert.equal(result.errors.length, 1);
+  assert.equal(exists("docs/a.txt"), false);
+  assert.equal(read("docs/b.txt"), "edited");
+  assert.equal(exists("docs"), true, "the folder still holds the refused file");
+});
+
+test("executeStaged judges a deletion by the path the plan named after its folder moved", async (t) => {
+  // The file is deleted at archive/old.txt, but the baseline knows it as docs/old.txt.
+  const { result, exists } = await runStagedFileDeletes(t, {
+    baselineFiles: { "docs/old.txt": "old" },
+    localFiles: { "docs/old.txt": "old" },
+    staged: [
+      { action: "move_local", path: "archive", localPath: "archive", sourcePath: "docs" },
+      deleteFile("docs/old.txt"),
+    ],
+  });
+
+  assert.deepEqual(result.errors, []);
+  assert.equal(exists("archive/old.txt"), false);
+});
+
+test("executeStaged does not re-read a file whose size and modification time match the baseline", async (t) => {
+  // The scanner treats such a file as unchanged without hashing it; so does the guard.
+  const { result, exists } = await runStagedFileDeletes(t, {
+    baselineFiles: { "a.txt": "a" },
+    statInBaseline: true,
+    localFiles: { "a.txt": "b" }, // different bytes, same size; the baseline md5 is not consulted
+    staged: [deleteFile("a.txt")],
+  });
+
+  assert.deepEqual(result.errors, []);
+  assert.equal(exists("a.txt"), false);
+});
+
+test("executeStaged treats a file that vanished before deletion as already deleted", async (t) => {
+  const { result } = await runStagedFileDeletes(t, {
+    baselineFiles: { "a.txt": "a" },
+    localFiles: { "other.txt": "x" },
+    staged: [deleteFile("a.txt")],
+  });
+
+  assert.deepEqual(result.errors, []);
+});
+
+// A download replaces the local file at its path. That may only cost the user
+// nothing: the file already holds what Drive has, or has not changed since the
+// last sync — or they chose to overwrite it, and then it must still be as it
+// was when they chose.
+
+async function runStagedDownload(t, {
+  localFiles = {},
+  baselineFiles = {},
+  entry,
+  remoteContent = "remote version",
+  beforeTransfer = null,
+}) {
+  const workspaceRoot = createTempDirectory(t, "aethel-download-guard-");
+  initWorkspace(workspaceRoot, null, "My Drive");
+  for (const [relativePath, content] of Object.entries(localFiles)) {
+    const absolutePath = path.join(workspaceRoot, ...relativePath.split("/"));
+    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+    await fs.writeFile(absolutePath, content);
+  }
+  const files = {};
+  const baselineLocal = {};
+  for (const [relativePath, spec] of Object.entries(baselineFiles)) {
+    const digest = md5(Buffer.from(spec.content));
+    files[spec.id] = { id: spec.id, path: relativePath, localPath: spec.localPath || relativePath, md5Checksum: digest };
+    baselineLocal[spec.localPath || relativePath] = { localPath: spec.localPath || relativePath, md5: digest };
+  }
+  writeSnapshot(workspaceRoot, {
+    timestamp: "2026-10-01T00:00:00.000Z",
+    message: "baseline",
+    files,
+    localFiles: baselineLocal,
+  });
+  const body = Buffer.from(remoteContent);
+  writeIndex(workspaceRoot, {
+    staged: [{
+      action: "download",
+      localPath: entry.path,
+      remotePath: entry.path,
+      remoteMimeType: "text/plain",
+      remoteMd5Checksum: md5(body),
+      ...entry,
+    }],
+  });
+  const drive = {
+    files: {
+      async get(params) {
+        if (params.alt !== "media") throw new Error("metadata should already be staged");
+        await beforeTransfer?.(workspaceRoot);
+        return { data: Readable.from([body]) };
+      },
+    },
+  };
+  const result = await executeStaged(drive, workspaceRoot);
+  const read = (relativePath) => fsNative.readFileSync(path.join(workspaceRoot, ...relativePath.split("/")), "utf8");
+  const leftovers = fsNative.readdirSync(workspaceRoot).filter((name) => name.startsWith(".aethel-download-"));
+  return { result, read, leftovers, workspaceRoot };
+}
+
+test("executeStaged replaces a file that is unchanged since the last sync", async (t) => {
+  const { result, read } = await runStagedDownload(t, {
+    localFiles: { "a.txt": "synced version" },
+    baselineFiles: { "a.txt": { id: "id-a", content: "synced version" } },
+    entry: { path: "a.txt", fileId: "id-a" },
+  });
+
+  assert.deepEqual(result.errors, []);
+  assert.equal(read("a.txt"), "remote version");
+});
+
+test("executeStaged refuses to replace a file edited since the last sync", async (t) => {
+  const { result, read, leftovers, workspaceRoot } = await runStagedDownload(t, {
+    localFiles: { "a.txt": "my unsynced edit" },
+    baselineFiles: { "a.txt": { id: "id-a", content: "synced version" } },
+    entry: { path: "a.txt", fileId: "id-a" },
+  });
+
+  assert.equal(result.downloaded, 0);
+  assert.equal(result.errors.length, 1);
+  assert.match(result.errors[0], /Refusing to overwrite a\.txt: it changed locally since the last sync/);
+  assert.equal(read("a.txt"), "my unsynced edit");
+  assert.deepEqual(leftovers, [], "no half-written download is left behind");
+  assert.equal(readIndex(workspaceRoot).staged.length, 1, "the refused entry stays staged");
+});
+
+test("executeStaged refuses to replace a different local file Drive has not synced", async (t) => {
+  const { result, read } = await runStagedDownload(t, {
+    localFiles: { "a.txt": "a file of my own" },
+    entry: { path: "a.txt", fileId: "id-a" },
+  });
+
+  assert.match(result.errors[0], /a different local file is already there that Drive has not synced/);
+  assert.equal(read("a.txt"), "a file of my own");
+});
+
+test("executeStaged leaves a file that already holds the Drive version alone", async (t) => {
+  const { result, read } = await runStagedDownload(t, {
+    localFiles: { "a.txt": "remote version" },
+    entry: { path: "a.txt", fileId: "id-a" },
+  });
+
+  assert.deepEqual(result.errors, []);
+  assert.equal(read("a.txt"), "remote version");
+});
+
+test("executeStaged protects a file edited while its replacement downloads", async (t) => {
+  const { result, read, leftovers } = await runStagedDownload(t, {
+    localFiles: { "a.txt": "synced version" },
+    baselineFiles: { "a.txt": { id: "id-a", content: "synced version" } },
+    entry: { path: "a.txt", fileId: "id-a" },
+    // The file is as synced when the download starts and edited before it ends.
+    beforeTransfer: (root) => fs.writeFile(path.join(root, "a.txt"), "edited mid-transfer"),
+  });
+
+  assert.match(result.errors[0], /Refusing to overwrite a\.txt/);
+  assert.equal(read("a.txt"), "edited mid-transfer");
+  assert.deepEqual(leftovers, []);
+});
+
+test("executeStaged recognises a file Drive replaced under a new ID at the same path", async (t) => {
+  const { result, read } = await runStagedDownload(t, {
+    localFiles: { "a.txt": "synced version" },
+    baselineFiles: { "a.txt": { id: "old-id", content: "synced version" } },
+    entry: { path: "a.txt", fileId: "new-id" },
+  });
+
+  assert.deepEqual(result.errors, []);
+  assert.equal(read("a.txt"), "remote version");
+});
+
+test("executeStaged finds the baseline of a file whose folder was renamed locally", async (t) => {
+  // The file now lives at docs2/a.txt; the baseline knows it as docs/a.txt.
+  const { result, read } = await runStagedDownload(t, {
+    localFiles: { "docs2/a.txt": "synced version" },
+    baselineFiles: { "docs/a.txt": { id: "id-a", content: "synced version" } },
+    entry: { path: "docs/a.txt", localPath: "docs2/a.txt", fileId: "id-a" },
+  });
+
+  assert.deepEqual(result.errors, []);
+  assert.equal(read("docs2/a.txt"), "remote version");
+});
+
+test("executeStaged replaces a file the user chose to overwrite, edits and all", async (t) => {
+  const { result, read } = await runStagedDownload(t, {
+    localFiles: { "a.txt": "edit made before choosing" },
+    baselineFiles: { "a.txt": { id: "id-a", content: "synced version" } },
+    entry: {
+      path: "a.txt",
+      fileId: "id-a",
+      overwriteLocal: true,
+      localMd5: md5(Buffer.from("edit made before choosing")),
+    },
+  });
+
+  assert.deepEqual(result.errors, []);
+  assert.equal(read("a.txt"), "remote version");
+});
+
+test("executeStaged refuses an overwrite when the file was edited after the user chose it", async (t) => {
+  const { result, read } = await runStagedDownload(t, {
+    localFiles: { "a.txt": "edit made after choosing" },
+    entry: {
+      path: "a.txt",
+      fileId: "id-a",
+      overwriteLocal: true,
+      localMd5: md5(Buffer.from("the state they chose against")),
+    },
+  });
+
+  assert.match(result.errors[0], /Refusing to overwrite a\.txt: it was edited after you chose/);
+  assert.equal(read("a.txt"), "edit made after choosing");
+});
+
+test("executeStaged overwrites without a recorded state when the user chose to", async (t) => {
+  const { result, read } = await runStagedDownload(t, {
+    localFiles: { "a.txt": "whatever is there" },
+    entry: { path: "a.txt", fileId: "id-a", overwriteLocal: true },
+  });
+
+  assert.deepEqual(result.errors, []);
+  assert.equal(read("a.txt"), "remote version");
+});
+
+test("executeStaged does not guard a Google Workspace export, which is a derived file", async (t) => {
+  const workspaceRoot = createTempDirectory(t, "aethel-export-");
+  initWorkspace(workspaceRoot, null, "My Drive");
+  await fs.writeFile(path.join(workspaceRoot, "plan.docx"), "previous export");
+  writeSnapshot(workspaceRoot, {
+    timestamp: "2026-10-01T00:00:00.000Z",
+    message: "baseline",
+    files: {},
+    localFiles: {},
+  });
+  writeIndex(workspaceRoot, {
+    staged: [{
+      action: "download",
+      path: "plan",
+      localPath: "plan",
+      fileId: "doc-1",
+      remotePath: "plan",
+      remoteMimeType: "application/vnd.google-apps.document",
+    }],
+  });
+  const result = await executeStaged({
+    files: { async export() { return { data: Readable.from(["new export"]) }; } },
+  }, workspaceRoot);
+
+  assert.deepEqual(result.errors, []);
+  assert.equal(fsNative.readFileSync(path.join(workspaceRoot, "plan.docx"), "utf8"), "new export");
+});
+
 test("downloadFile rejects unsupported Google Workspace files before media download", async () => {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-download-"));
 

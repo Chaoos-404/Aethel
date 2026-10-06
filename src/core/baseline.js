@@ -78,6 +78,23 @@ export function advanceBaseline(previous, remoteFiles, scannedLocal, appliedChan
     remote.set(remoteEntry.id, { ...remoteEntry, localPath });
     carriedLocal[localPath] = localEntry;
   }
+  // A move or deletion can leave the old parent directories empty, and the
+  // executor prunes the ones Drive no longer has. Their folder entries were
+  // recorded as empty folders in the baseline; keeping an entry for a folder
+  // that is gone from both sides would later read as a local deletion of
+  // whatever Drive next puts at that path.
+  for (const change of appliedChanges) {
+    const kind = action(change);
+    if (kind !== "move_local" && kind !== "delete_local") continue;
+    const origin = kind === "move_local" ? change.sourcePath : change.localPath || change.path;
+    if (typeof origin !== "string") continue;
+    for (let slash = origin.lastIndexOf("/"); slash > 0; slash = origin.lastIndexOf("/", slash - 1)) {
+      const ancestor = origin.slice(0, slash);
+      if (!carriedLocal[ancestor]?.isFolder) continue;
+      if (Object.keys(currentLocal).some(pathValue => under(pathValue, ancestor))) continue;
+      delete carriedLocal[ancestor];
+    }
+  }
   return {
     remote: [...remote.values()],
     local: { files: carriedLocal, packedDirs: scannedLocal?.packedDirs || {} },

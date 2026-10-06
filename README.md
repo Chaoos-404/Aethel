@@ -164,11 +164,19 @@ This is the safest workflow when both Drive and local files may have changed.
 aethel fetch                   # refresh and preview remote changes
 aethel pull -m "pull"          # apply remote changes since the last snapshot
 aethel pull --all              # download the full remote tree
+aethel pull --all --force      # ...and replace locally edited files
 aethel pull path/to/folder     # pull only matching paths
 ```
 
-Use `pull --all` for a first full download or when you intentionally want to
-rehydrate local files from the current Drive tree.
+Use `pull --all` for a first full download or to rehydrate local files from the
+current Drive tree. Files you have edited since the last sync are kept: their
+downloads are refused and reported, and everything else still proceeds. Push
+those files to keep your version, or add `--force` to replace them with the
+Drive version. With `--force`, a file edited after the pull started is still
+not overwritten.
+
+Plain `pull` never replaces such a file either: when both sides changed it, the
+file is reported as a conflict, and `pull --force` takes the Drive version.
 
 ### Push To Drive
 

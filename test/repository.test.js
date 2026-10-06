@@ -7,7 +7,7 @@ import { Repository } from "../src/core/repository.js";
 import { initWorkspace, writeSnapshot } from "../src/core/config.js";
 import { computeDiff, ChangeType } from "../src/core/diff.js";
 import { writeRemoteCache } from "../src/core/remote-cache.js";
-import { conflictResolutionChange } from "../src/core/staging.js";
+import { conflictResolutionChange, fullPullDownloadOptions } from "../src/core/staging.js";
 
 const FOLDER_MIME = "application/vnd.google-apps.folder";
 
@@ -240,6 +240,115 @@ test("stageRemoteFilesForDownload stages full remote downloads", () => {
         isFolder: true,
       },
     ]);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("stageChanges carries the retained ancestor, including the empty one for the root", () => {
+  const root = makeTmpWorkspace();
+  try {
+    const repo = new Repository(root);
+    repo.stageChanges([
+      {
+        path: "docs/sub/x.txt",
+        suggestedAction: "delete_local",
+        fileId: "x",
+        retainDirectory: "docs/sub",
+      },
+      {
+        path: "gone",
+        suggestedAction: "delete_local",
+        fileId: "gone-id",
+        retainDirectory: "",
+      },
+      { path: "plain.txt", suggestedAction: "delete_local", fileId: "plain-id" },
+    ]);
+
+    const byPath = Object.fromEntries(repo.getStagedEntries().map((entry) => [entry.path, entry]));
+    assert.equal(byPath["docs/sub/x.txt"].retainDirectory, "docs/sub");
+    assert.equal(byPath.gone.retainDirectory, "");
+    assert.equal("retainDirectory" in byPath["plain.txt"], false);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("stageFullRemotePull records an overwrite choice and the local state it was made against", () => {
+  const root = makeTmpWorkspace();
+  try {
+    const repo = new Repository(root);
+    repo.stageFullRemotePull(
+      [
+        { id: "a-id", path: "a.txt", mimeType: "text/plain", md5Checksum: "remote-md5" },
+        { id: "new-id", path: "new.txt", mimeType: "text/plain", md5Checksum: "new-md5" },
+        { id: "dir-id", path: "empty", mimeType: FOLDER_MIME, isFolder: true },
+      ],
+      [],
+      [],
+      {
+        overwriteLocal: true,
+        localFiles: { "a.txt": { md5: "local-md5" }, empty: { isFolder: true } },
+      }
+    );
+
+    const byPath = Object.fromEntries(repo.getStagedEntries().map((entry) => [entry.path, entry]));
+    assert.equal(byPath["a.txt"].overwriteLocal, true);
+    assert.equal(byPath["a.txt"].localMd5, "local-md5");
+    assert.equal(byPath["new.txt"].overwriteLocal, true);
+    assert.equal("localMd5" in byPath["new.txt"], false, "nothing was there when it was planned");
+    assert.equal("overwriteLocal" in byPath.empty, false, "folders are not overwritten");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("a full pull replaces local files only when forced", () => {
+  const local = { files: { "a.txt": { md5: "local-md5" } }, packedDirs: {} };
+
+  assert.deepEqual(fullPullDownloadOptions({ local }), {});
+  assert.deepEqual(fullPullDownloadOptions({ force: false, local }), {});
+  assert.deepEqual(fullPullDownloadOptions({ force: undefined, local }), {});
+  assert.deepEqual(fullPullDownloadOptions(), {});
+
+  assert.deepEqual(fullPullDownloadOptions({ force: true, local }), {
+    overwriteLocal: true,
+    localFiles: local.files,
+  });
+  // A bare path-to-entry map works as well as a full scan result.
+  assert.deepEqual(fullPullDownloadOptions({ force: true, local: local.files }), {
+    overwriteLocal: true,
+    localFiles: local.files,
+  });
+});
+
+test("only a deliberate choice of the Drive version marks a download as an overwrite", () => {
+  const root = makeTmpWorkspace();
+  try {
+    const repo = new Repository(root);
+    const conflict = {
+      path: "notes.md",
+      fileId: "drive-file-id",
+      localMeta: { localPath: "notes.md", md5: "local-md5" },
+      remoteMeta: { path: "notes.md", md5Checksum: "remote-md5" },
+      snapshotMeta: { path: "notes.md", md5: "old-md5" },
+      suggestedAction: "conflict",
+    };
+
+    repo.stageConflictResolution(conflict, "theirs");
+    const [theirs] = repo.getStagedEntries();
+    assert.equal(theirs.action, "download");
+    assert.equal(theirs.overwriteLocal, true);
+    assert.equal(theirs.localMd5, "local-md5", "the state the user chose against");
+
+    repo.unstageAll();
+    repo.stageConflictResolution(conflict, "both");
+    const copy = repo.getStagedEntries().find((entry) => entry.path === "notes.remote.md");
+    assert.equal(copy.overwriteLocal, true);
+
+    repo.unstageAll();
+    repo.stageChanges([{ path: "plain.txt", suggestedAction: "download", fileId: "plain-id" }]);
+    assert.equal("overwriteLocal" in repo.getStagedEntries()[0], false);
   } finally {
     cleanup(root);
   }

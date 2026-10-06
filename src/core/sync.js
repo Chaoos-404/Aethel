@@ -9,7 +9,7 @@ import {
   uploadFile,
 } from "./drive-api.js";
 import { pullPack, pushPack } from "./pack-sync.js";
-import { md5Local } from "./snapshot.js";
+import { md5Local, scanLocal } from "./snapshot.js";
 import { logEvent, withRunLog } from "./logger.js";
 import { openExecutionJournal, operationKey } from "./execution-journal.js";
 import { withWorkspaceLock } from "./workspace-lock.js";
@@ -154,7 +154,7 @@ export class CommitResult {
   }
 }
 
-async function downloadStagedFile(drive, entry, root, snapshot = null) {
+async function downloadStagedFile(drive, entry, root, snapshot = null, guard = null) {
   const localRelativePath = entry.localPath || entry.path;
   const localAbsolutePath = toLocalAbsolutePath(root, localRelativePath);
 
@@ -183,7 +183,16 @@ async function downloadStagedFile(drive, entry, root, snapshot = null) {
     fileMeta = { ...response.data, id: fileId };
   }
 
-  await downloadFile(drive, fileMeta, localAbsolutePath);
+  await downloadFile(drive, fileMeta, localAbsolutePath, {
+    guardReplace: guard
+      ? (targetPath, downloadedMd5) =>
+        guard.assertDownloadReplaceable(
+          entry,
+          targetPath,
+          downloadedMd5 || fileMeta.md5Checksum || null
+        )
+      : null,
+  });
 }
 
 async function handleMissingUploadSource(drive, entry, snapshot, driveFolderId) {
@@ -297,7 +306,7 @@ async function uploadStagedFile(drive, entry, root, driveFolderId, snapshot, con
   return "uploaded";
 }
 
-async function deleteLocalFile(entry, root) {
+async function deleteLocalFile(entry, root, guard = null) {
   const localRelativePath = entry.localPath || entry.path;
   const localAbsolutePath = toLocalAbsolutePath(root, localRelativePath);
 
@@ -314,29 +323,184 @@ async function deleteLocalFile(entry, root) {
   if (stat.isDirectory()) {
     if (entry.recursiveLocalDelete) {
       await fs.promises.rm(localAbsolutePath, { recursive: true, force: false });
-      return;
+    } else {
+      await fs.promises.rmdir(localAbsolutePath);
     }
-
-    await fs.promises.rmdir(localAbsolutePath);
+    // Only entries that know which ancestors Drive keeps prune upward; a bare
+    // folder delete has never emptied its parents on its own.
+    if (typeof entry.retainDirectory === "string") {
+      await cleanupEmptyParentDirectories(root, localRelativePath, entry.retainDirectory);
+    }
     return;
   }
 
-  await fs.promises.unlink(localAbsolutePath);
-
-  // Clean up empty parent directories up to workspace root
-  let currentPath = path.dirname(localAbsolutePath);
-  const resolvedRoot = path.resolve(root);
-
-  while (currentPath !== resolvedRoot) {
-    try {
-      const contents = await fs.promises.readdir(currentPath);
-      if (contents.length > 0) break;
-      await fs.promises.rmdir(currentPath);
-    } catch {
-      break;
-    }
-    currentPath = path.dirname(currentPath);
+  await guard?.assertFileDeletable(entry, localAbsolutePath, stat);
+  try {
+    await fs.promises.unlink(localAbsolutePath);
+  } catch (err) {
+    if (err?.code !== "ENOENT") throw err; // removed since the check: same outcome
   }
+  await cleanupEmptyParentDirectories(root, localRelativePath, entry.retainDirectory);
+}
+
+const UNSYNCED_PREVIEW_LIMIT = 5;
+
+function localWorkAtRisk(message) {
+  return Object.assign(new Error(message), { code: "LOCAL_WORK_AT_RISK" });
+}
+
+/**
+ * Guards for local deletes that apply a deletion made on Drive. Such a delete
+ * is only safe for a file Drive has, unchanged since the last sync: anything
+ * else — a file Drive never received, an edit it has not seen — exists nowhere
+ * else once it is gone. The plan checked this when it was made, but staged
+ * entries outlive their plan and files change in between, so verify again
+ * against the baseline right before deleting.
+ *
+ * Without a baseline there is nothing to compare against and the delete is
+ * allowed, as before. The check and the delete are separate steps, so an edit
+ * landing in between is still possible; the window is a few milliseconds.
+ */
+function createLocalWorkGuard(root, snapshot) {
+  // The baseline records the files Drive has, as of the last sync, by path.
+  let syncedByPath = null;
+  const synced = () => {
+    if (!syncedByPath) {
+      syncedByPath = new Map();
+      for (const meta of Object.values(snapshot?.files || {})) {
+        if (meta.path) syncedByPath.set(meta.path, meta);
+        if (meta.localPath) syncedByPath.set(meta.localPath, meta);
+      }
+    }
+    return syncedByPath;
+  };
+  const tracked = () => synced();
+  const hashOrNull = async (absolutePath) => {
+    try {
+      return await md5Local(absolutePath);
+    } catch (err) {
+      if (isMissingLocalFileError(err)) return null;
+      throw err;
+    }
+  };
+  /** True when size and modification time are those recorded at the last sync. */
+  const matchesBaselineStat = (stat, baseline) =>
+    stat.size === baseline.size &&
+    new Date(stat.mtimeMs).toISOString() === baseline.modifiedTime;
+
+  // One scan per run (ignore rules and packed directories apply, exactly as for
+  // diffing), and only when a recursive delete needs it.
+  let scanned = null;
+  const scanOnce = () => (scanned ??= scanLocal(root).then((scan) => scan.files));
+
+  return {
+    /** A recursive folder delete takes every local file under the folder. */
+    async assertFolderDeletable(entry) {
+      if (!snapshot) return;
+
+      const folderPath = entry.localPath || entry.path;
+      const atRisk = [];
+      for (const [filePath, meta] of Object.entries(await scanOnce())) {
+        if (meta.isFolder || !filePath.startsWith(`${folderPath}/`)) continue;
+        const baseline = snapshot.localFiles?.[filePath];
+        if (!tracked().has(filePath) || !baseline || baseline.md5 !== meta.md5) {
+          atRisk.push(filePath);
+        }
+      }
+      if (atRisk.length === 0) return;
+
+      const shown = atRisk.slice(0, UNSYNCED_PREVIEW_LIMIT).join(", ");
+      const more = atRisk.length > UNSYNCED_PREVIEW_LIMIT
+        ? ` (+${atRisk.length - UNSYNCED_PREVIEW_LIMIT} more)`
+        : "";
+      throw localWorkAtRisk(
+        `Refusing to delete ${folderPath}: it holds local files Drive does not have ` +
+        `as they are now: ${shown}${more}. Push or move them, then pull again.`
+      );
+    },
+
+    /**
+     * A single-file delete. The baseline is keyed by the path the plan named
+     * (`entry.path`); `absolutePath` is where the file is now, which differs
+     * after an ancestor folder was moved earlier in the same run.
+     */
+    async assertFileDeletable(entry, absolutePath, stat) {
+      if (!snapshot?.localFiles) return;
+
+      const baselinePath = entry.path;
+      const baseline = snapshot.localFiles[baselinePath];
+      if (!baseline || !tracked().has(baselinePath)) {
+        throw localWorkAtRisk(
+          `Refusing to delete ${baselinePath}: Drive has no record of this file, ` +
+          `so deleting it would lose the only copy. Push it or move it away, then pull again.`
+        );
+      }
+
+      // Same size and modification time as at the last sync is how the scanner
+      // already decides a file is unchanged; only a file that moved is re-read.
+      if (matchesBaselineStat(stat, baseline)) return;
+
+      const currentMd5 = await hashOrNull(absolutePath);
+      if (currentMd5 === null) return; // already gone
+      if (currentMd5 !== baseline.md5) {
+        throw localWorkAtRisk(
+          `Refusing to delete ${baselinePath}: it changed locally since the last sync. ` +
+          `Push the edit or resolve the conflict, then pull again.`
+        );
+      }
+    },
+
+    /**
+     * A download replaces the local file at `absolutePath`, if there is one.
+     * That is safe when the local file already holds what Drive has, or has not
+     * changed since the last sync. Replacing a file the user chose to overwrite
+     * (`overwriteLocal`: `pull --all --force`, `pull --force`, `resolve --theirs`) is allowed,
+     * but only as it was when they chose: an edit made since is not covered by
+     * that choice. `remoteMd5` is the content about to be written.
+     */
+    async assertDownloadReplaceable(entry, absolutePath, remoteMd5) {
+      let stat;
+      try {
+        stat = await fs.promises.lstat(absolutePath);
+      } catch (err) {
+        if (isMissingLocalFileError(err)) return; // nothing to lose
+        throw err;
+      }
+      if (stat.isDirectory()) return; // not a file; the replacement fails on its own
+
+      const displayPath = entry.localPath || entry.path;
+      const refuse = (reason) => localWorkAtRisk(
+        `Refusing to overwrite ${displayPath}: ${reason} ` +
+        `Push it to keep your version, or run 'aethel pull --force' ` +
+        `(with --all for a full pull) to take the Drive version.`
+      );
+
+      if (entry.overwriteLocal) {
+        if (!entry.localMd5) return; // no state was recorded when the choice was made
+        const current = await hashOrNull(absolutePath);
+        if (current === null || current === entry.localMd5 || current === remoteMd5) return;
+        throw refuse("it was edited after you chose to replace it with the Drive version.");
+      }
+
+      // The baseline's record of this file: by Drive ID, else by the path a
+      // replacement file now has (Drive gives a re-uploaded file a new ID).
+      const bound = snapshot?.files?.[entry.fileId] ?? synced().get(entry.path) ?? null;
+      const baselinePath = bound && (bound.localPath || bound.path);
+      const baseline = baselinePath ? snapshot.localFiles?.[baselinePath] ?? null : null;
+      if (baseline && matchesBaselineStat(stat, baseline)) return;
+
+      const current = await hashOrNull(absolutePath);
+      if (current === null) return;
+      if (remoteMd5 && current === remoteMd5) return; // already what Drive has
+      if (baseline && current === baseline.md5) return; // unchanged since the last sync
+
+      throw refuse(
+        baseline
+          ? "it changed locally since the last sync."
+          : "a different local file is already there that Drive has not synced."
+      );
+    },
+  };
 }
 
 async function moveLocalFolder(entry, root) {
@@ -437,11 +601,21 @@ function remapPathAfterRename(pathValue, fromPath, toPath) {
   return pathValue;
 }
 
-async function cleanupEmptyParentDirectories(root, relativePath) {
+/**
+ * Remove directories left empty above `relativePath`, walking up to the
+ * workspace root. `retainDirectory` is the deepest ancestor that still exists
+ * on Drive: Drive keeps empty folders, so that directory and everything above
+ * it stay. Without it every empty ancestor goes (older staged entries).
+ */
+async function cleanupEmptyParentDirectories(root, relativePath, retainDirectory) {
   let currentPath = path.dirname(toLocalAbsolutePath(root, relativePath));
   const resolvedRoot = path.resolve(root);
+  const retainedPath = retainDirectory
+    ? toLocalAbsolutePath(root, retainDirectory)
+    : null;
 
   while (currentPath !== resolvedRoot) {
+    if (currentPath === retainedPath) break;
     try {
       const contents = await fs.promises.readdir(currentPath);
       if (contents.length > 0) break;
@@ -690,8 +864,25 @@ async function executeStagedOperations(drive, root, progress) {
       );
       if (remapped !== (entry.localPath || entry.path)) {
         entry.localPath = remapped;
+        // The retained ancestor lives in the same path space as the entry.
+        if (entry.retainDirectory) {
+          entry.retainDirectory = remapPathAfterRename(
+            entry.retainDirectory,
+            move.sourcePath,
+            moveDestination
+          );
+        }
       }
     }
+  }
+
+  // The old parents of a moved folder are now empty. Drop the ones Drive no
+  // longer has, after every move, so a pending move never loses its parent.
+  // Otherwise they linger and the next scan reads them as new local folders.
+  for (const { entry: move } of localMoves) {
+    if (failedEntries.has(move) || !move.sourcePath) continue;
+    if (typeof move.retainDirectory !== "string") continue;
+    await cleanupEmptyParentDirectories(root, move.sourcePath, move.retainDirectory);
   }
 
   // Run local file deletes before folder deletes so a remote-deleted tree can
@@ -710,12 +901,13 @@ async function executeStagedOperations(drive, root, progress) {
     (left, right) => right.entry.path.split("/").length - left.entry.path.split("/").length
   );
 
+  const localWorkGuard = createLocalWorkGuard(root, snapshot);
   const localDeleteResults = await Promise.allSettled(
     localFileDeletes.map(async ({ entry }) => {
       logOperation("info", "operation.started", entry);
       try {
         assertDependencies(entry);
-        await deleteLocalFile(entry, root);
+        await deleteLocalFile(entry, root, localWorkGuard);
         result.deletedLocal++;
         logOperation("info", "operation.completed", entry);
       } catch (err) {
@@ -733,14 +925,19 @@ async function executeStagedOperations(drive, root, progress) {
     .filter(({ entry }) => !failedEntries.has(entry))
     .sort((left, right) => right.entry.path.split("/").length - left.entry.path.split("/").length);
   for (const { entry } of successfulLocalFileDeletes) {
-    await cleanupEmptyParentDirectories(root, entry.localPath || entry.path);
+    await cleanupEmptyParentDirectories(
+      root,
+      entry.localPath || entry.path,
+      entry.retainDirectory
+    );
   }
 
   for (const { entry } of localFolderDeletes) {
     logOperation("info", "operation.started", entry);
     try {
       assertDependencies(entry);
-      await deleteLocalFile(entry, root);
+      if (entry.recursiveLocalDelete) await localWorkGuard.assertFolderDeletable(entry);
+      await deleteLocalFile(entry, root, localWorkGuard);
       result.deletedLocal++;
       logOperation("info", "operation.completed", entry);
     } catch (err) {
@@ -767,7 +964,7 @@ async function executeStagedOperations(drive, root, progress) {
       assertDependencies(entry);
       const action = entry.action;
       if (action === "download") {
-        await downloadStagedFile(drive, entry, root, snapshot);
+        await downloadStagedFile(drive, entry, root, snapshot, localWorkGuard);
         if (entry.isFolder) result.foldersCreated++;
         else result.downloaded++;
       } else if (action === "upload") {
