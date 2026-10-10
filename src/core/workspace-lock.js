@@ -17,6 +17,40 @@ export function assertWorkspaceWritable(root) {
   if (fs.existsSync(lockPath(canonical))) throw lockedError(canonical);
 }
 
+/**
+ * Who holds the workspace lock right now, or null when nobody does. Read-only
+ * and never throws, so read-only commands can use it to warn about a sync that
+ * is applying changes while they look.
+ */
+export function readWorkspaceLock(root) {
+  try {
+    const filename = lockPath(fs.realpathSync(root));
+    if (!fs.existsSync(filename)) return null;
+    try {
+      const { pid, host, startedAt } = JSON.parse(fs.readFileSync(filename, "utf8"));
+      return { pid, host, startedAt };
+    } catch {
+      // The owner is between creating the lock and writing its details.
+      return {};
+    }
+  } catch {
+    return null;
+  }
+}
+
+/** One-line notice for a read-only command that ran while a sync holds the lock. */
+export function describeActiveSync(lock) {
+  const who = [
+    lock?.pid ? `pid ${lock.pid}` : null,
+    lock?.host ? `host ${lock.host}` : null,
+    lock?.startedAt ? `started ${lock.startedAt}` : null,
+  ].filter(Boolean).join(", ");
+  return `Notice: a sync is running in this workspace${who ? ` (${who})` : ""}. ` +
+    "Drive and local files may be half-applied, so the changes below can be wrong; " +
+    "run this command again when it has finished. " +
+    "If no sync is running, a crashed one left .aethel/sync.lock behind.";
+}
+
 /** Never steal a lock based on elapsed time: a slow or suspended sync may own it. */
 export async function withWorkspaceLock(root, work) {
   const canonical = fs.realpathSync(root);

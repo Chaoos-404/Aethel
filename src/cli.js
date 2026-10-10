@@ -14,9 +14,14 @@ import {
 } from "./core/config.js";
 import { createDefaultIgnoreFile, loadIgnoreRules } from "./core/ignore.js";
 import { createProgressBar, createSpinner } from "./core/progress.js";
-import { summarizeChanges, summarizeStagedEntries } from "./core/change-summary.js";
+import {
+  driveOnlyEmptyFolderHint,
+  summarizeChanges,
+  summarizeStagedEntries,
+} from "./core/change-summary.js";
 import { remoteCacheEnabledByDefault } from "./core/sync-cache-policy.js";
 import { logEvent, withRunLog } from "./core/logger.js";
+import { describeActiveSync, readWorkspaceLock } from "./core/workspace-lock.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf-8"));
@@ -706,6 +711,11 @@ async function handleStatus(options) {
   });
   const staged = repo.getStagedEntries();
 
+  // Status takes no lock, so a push running in another process can be read
+  // half-applied. Warn on stderr, which keeps --short output parseable.
+  const activeSync = readWorkspaceLock(repo.root);
+  if (activeSync) console.error(describeActiveSync(activeSync));
+
   const hasPackChanges = diff.hasPackChanges || (options.verbose && diff.syncedPacks?.length > 0);
 
   if (diff.isClean && staged.length === 0 && !hasPackChanges) {
@@ -741,6 +751,8 @@ async function handleStatus(options) {
   if (unstagedRemote.length) {
     console.log(`\nRemote changes (${unstagedRemote.length}):`);
     printChangeSummaryEntries(unstagedRemote, { detail: options.detail });
+    const emptyFolderHint = driveOnlyEmptyFolderHint(unstagedRemote);
+    if (emptyFolderHint) console.log(emptyFolderHint);
   }
 
   if (unstagedLocal.length) {
