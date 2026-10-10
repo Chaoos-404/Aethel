@@ -88,6 +88,32 @@ test("size limit preserves valid JSON and terminal outcome", t => {
   assert.equal(events.at(-1).event, "run.finished");
 });
 
+test("size limit keeps the outcome events and counts the records it dropped", t => {
+  const root = createTempDirectory(t, "aethel-log-");
+  const logger = createRunLogger(root, { maxBytes: 32768 });
+  for (let i = 0; i < 100; i++) logger.log("info", "operation.completed", { payload: "x".repeat(2048) });
+  logger.log("info", "sync.finished", { summary: "5757 uploaded", failures: 0 });
+  logger.log("info", "baseline.saved", { operations: 100 });
+  logger.finish("completed");
+  const file = readLogFiles(root)[0];
+  assert.ok(Buffer.byteLength(file.text) <= 32768);
+  const events = parseRecords(file.text);
+  const written = events.filter(e => e.event === "operation.completed").length;
+  assert.ok(written > 0 && written < 100);
+  assert.equal(events.find(e => e.event === "sync.finished").details.summary, "5757 uploaded");
+  assert.equal(events.find(e => e.event === "baseline.saved").details.operations, 100);
+  // Every operation record is either in the file or counted as dropped.
+  assert.equal(events.at(-1).details.droppedRecords + written, 100);
+});
+
+test("a run that stays under the size limit reports no dropped records", t => {
+  const root = createTempDirectory(t, "aethel-log-");
+  const logger = createRunLogger(root);
+  logger.log("info", "operation.completed", {});
+  logger.finish("completed");
+  assert.equal(parseRecords(readLogFiles(root)[0].text).at(-1).details.droppedRecords, undefined);
+});
+
 test("unwritable log destination warns once without throwing", t => {
   const root = createTempDirectory(t, "aethel-log-");
   fs.mkdirSync(path.join(root, ".aethel"));
