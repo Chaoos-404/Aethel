@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { summarizeChanges, summarizeStagedEntries } from "../src/core/change-summary.js";
+import {
+  driveOnlyEmptyFolderHint,
+  summarizeChanges,
+  summarizeStagedEntries,
+} from "../src/core/change-summary.js";
 
 function change(path, shortStatus = "ML", description = "modified locally") {
   return { path, shortStatus, description };
@@ -128,4 +132,16 @@ test("summarizeStagedEntries detail mode returns every staged entry", () => {
     "01_Courses/00_Compiler/IC_Lab/src/Lab01/Exercise/00_TESTBED",
     "01_Courses/00_Compiler/IC_Lab/src/Lab01/Exercise/01_RTL",
   ]);
+});
+
+test("driveOnlyEmptyFolderHint counts only empty folders that are new on Drive", () => {
+  const folder = (path) => ({ path, changeType: "remote_added", remoteMeta: { isFolder: true } });
+  const file = (path) => ({ path, changeType: "remote_added", remoteMeta: { isFolder: false } });
+
+  assert.equal(driveOnlyEmptyFolderHint([file("a.txt")]), null);
+  assert.equal(driveOnlyEmptyFolderHint([{ path: "gone", changeType: "local_deleted", remoteMeta: { isFolder: true } }]), null);
+  assert.match(driveOnlyEmptyFolderHint([folder("docs/sub")]), /^ {2}1 of these is an empty folder that exists only on Drive\./);
+  const many = driveOnlyEmptyFolderHint([folder("a"), folder("b"), file("c.txt")]);
+  assert.match(many, /2 of these are empty folders that exist only on Drive/);
+  assert.match(many, /aethel rm <path>.*aethel push/);
 });

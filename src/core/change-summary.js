@@ -225,3 +225,20 @@ export function summarizeStagedEntries(staged, { detail = false } = {}) {
 
   return entries.sort((left, right) => left.order - right.order);
 }
+
+/**
+ * Drive keeps empty folders, and a folder deleted locally after a sync emptied
+ * it comes back as "new on Drive". Say how to delete it from Drive instead of
+ * leaving the user to find out that pull would only recreate it.
+ */
+export function driveOnlyEmptyFolderHint(changes) {
+  const count = changes.filter(
+    (change) => change.changeType === "remote_added" && change.remoteMeta?.isFolder
+  ).length;
+  if (!count) return null;
+  return (
+    `  ${count === 1 ? "1 of these is an empty folder that exists" : `${count} of these are empty folders that exist`} only on Drive. ` +
+    "'aethel pull' creates them locally; to delete them from Drive instead, " +
+    "run 'aethel rm <path>' and then 'aethel push'."
+  );
+}

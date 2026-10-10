@@ -5,6 +5,16 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 const context = new AsyncLocalStorage();
 const MAX_RECORD_BYTES = 16 * 1024;
+// Events that carry a run's outcome. Once the size limit is reached the
+// per-operation records are dropped, but these still use the reserved space so
+// the totals of a large run can be read from the log.
+const OUTCOME_EVENTS = new Set([
+  "sync.started",
+  "sync.finished",
+  "execution.checkpointed",
+  "baseline.saved",
+  "run.error",
+]);
 const SECRET_KEY = /token|secret|password|authorization|cookie|credential|private.?key/i;
 
 function redactText(value) {
@@ -42,7 +52,7 @@ export function createRunLogger(root, {
   const directory = path.join(root, ".aethel", "logs");
   const activePath = path.join(directory, `${runId}.active.jsonl`);
   const finishedPath = path.join(directory, `${runId}.jsonl`);
-  let fd, bytes = 0, sequence = 0, warned = false, finished = false, limited = false;
+  let fd, bytes = 0, sequence = 0, warned = false, finished = false, limited = false, dropped = 0;
   const started = now();
   function warning() {
     if (warned) return;
@@ -81,7 +91,9 @@ export function createRunLogger(root, {
         line = JSON.stringify(record) + "\n";
       }
       const limit = Math.max(maxBytes, MAX_RECORD_BYTES * 2);
-      if (!terminal && bytes + Buffer.byteLength(line) > limit - MAX_RECORD_BYTES) {
+      const reserved = terminal || OUTCOME_EVENTS.has(event);
+      if (!reserved && bytes + Buffer.byteLength(line) > limit - MAX_RECORD_BYTES) {
+        dropped++;
         if (!limited) {
           limited = true;
           write("warn", "log.limit_reached", { maxBytes: limit }, true);
@@ -103,7 +115,7 @@ export function createRunLogger(root, {
     finish(status, details = {}) {
       if (finished) return;
       write(status === "failed" ? "error" : status === "incomplete" ? "warn" : "info", "run.finished",
-        { ...details, status, durationMs: now() - started }, true);
+        { ...details, status, durationMs: now() - started, ...(dropped ? { droppedRecords: dropped } : {}) }, true);
       finished = true;
       try {
         if (fd !== undefined) { fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined; }

@@ -1760,6 +1760,82 @@ test("withDriveRetry backs off on transient changes.list failures", async () => 
   assert.equal(response.data.changes.length, 0);
 });
 
+// Drive reports throttling as a 403 with a reason, shaped like googleapis errors.
+function driveHttpError(status, reason, message, headers = {}) {
+  const err = new Error(message);
+  err.code = status;
+  err.errors = [{ domain: "usageLimits", reason, message }];
+  err.response = { status, headers, data: { error: { errors: [{ reason, message }] } } };
+  return err;
+}
+
+function failingChangesList(fake, makeError, failures) {
+  const realList = fake.changes.list.bind(fake.changes);
+  const state = { calls: 0 };
+  fake.changes.list = async (params) => {
+    state.calls += 1;
+    if (state.calls <= failures) throw makeError();
+    return realList(params);
+  };
+  return state;
+}
+
+test("withDriveRetry retries the 403 Drive sends when a rate limit is exceeded", async () => {
+  const fake = createFakeDrive([]);
+  const state = failingChangesList(
+    fake,
+    () => driveHttpError(403, "userRateLimitExceeded", "User rate limit exceeded.", { "retry-after": "0.01" }),
+    2
+  );
+
+  const response = await withDriveRetry(fake).changes.list({ pageToken: "0" });
+
+  assert.equal(state.calls, 3);
+  assert.equal(response.data.changes.length, 0);
+});
+
+test("withDriveRetry recognises a rate limit by its message alone", async () => {
+  const fake = createFakeDrive([]);
+  const state = failingChangesList(fake, () => {
+    const err = new Error("User rate limit exceeded.");
+    err.code = 403;
+    err.response = { status: 403, headers: { "retry-after": "0.01" } };
+    return err;
+  }, 1);
+
+  await withDriveRetry(fake).changes.list({ pageToken: "0" });
+
+  assert.equal(state.calls, 2);
+});
+
+test("withDriveRetry gives up on a rate limit that never clears, after more attempts than a 5xx", async () => {
+  const fake = createFakeDrive([]);
+  const state = failingChangesList(
+    fake,
+    () => driveHttpError(403, "rateLimitExceeded", "Rate limit exceeded.", { "retry-after": "0.001" }),
+    Infinity
+  );
+
+  await assert.rejects(withDriveRetry(fake).changes.list({ pageToken: "0" }), /Rate limit exceeded/);
+
+  assert.equal(state.calls, 8);
+});
+
+test("withDriveRetry does not retry a 403 that waiting cannot fix", async () => {
+  for (const [reason, message] of [
+    ["forbidden", "The caller does not have permission"],
+    ["storageQuotaExceeded", "The user's Drive storage quota has been exceeded."],
+    ["dailyLimitExceeded", "Daily Limit Exceeded"],
+  ]) {
+    const fake = createFakeDrive([]);
+    const state = failingChangesList(fake, () => driveHttpError(403, reason, message), Infinity);
+
+    await assert.rejects(withDriveRetry(fake).changes.list({ pageToken: "0" }), new RegExp(message.slice(0, 12)));
+
+    assert.equal(state.calls, 1, reason);
+  }
+});
+
 test("uploadFile updates an existing same-name file and trashes duplicates", async () => {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aethel-upload-"));
 
