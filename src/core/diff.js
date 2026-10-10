@@ -997,6 +997,62 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
   snapshotFolderCandidates.sort(
     (left, right) => left.from.split("/").length - right.from.split("/").length
   );
+
+  // Local files by content hash, built the first time a folder has no sibling
+  // to match so that unchanged workspaces never pay for it.
+  let localPathsByMd5 = null;
+  const localPathsWithMd5 = (md5) => {
+    if (!localPathsByMd5) {
+      localPathsByMd5 = new Map();
+      for (const [pathValue, meta] of localFileEntries) {
+        if (meta.isFolder || !meta.md5) continue;
+        const known = localPathsByMd5.get(meta.md5);
+        if (known) known.push(pathValue);
+        else localPathsByMd5.set(meta.md5, [pathValue]);
+      }
+    }
+    return localPathsByMd5.get(md5) || [];
+  };
+
+  /**
+   * A folder moved under a different parent keeps every file byte for byte but
+   * has no sibling to be recognised by. Only one outcome counts as a move: a
+   * single new local folder that holds every tracked file of the missing folder
+   * at the same relative path with the same content. A folder that was edited
+   * while moving, or whose content exists in several places, stays what it was
+   * before — deletions plus uploads — rather than risk renaming the wrong one.
+   */
+  const findMovedFolderTarget = (expectedCurrentPath, descendants) => {
+    const relativeToFolder = (oldPath) =>
+      applyLocalFolderRenames(oldPath, locallyRenamedFolders).slice(expectedCurrentPath.length);
+    const trackedFiles = descendants.filter(([, meta]) => !meta.isFolder && meta.md5);
+    if (trackedFiles.length === 0) return null;
+
+    const [anchorPath, anchorMeta] = trackedFiles[0];
+    const anchorSuffix = relativeToFolder(anchorPath);
+    const targets = new Set();
+    for (const localPath of localPathsWithMd5(anchorMeta.md5)) {
+      if (!localPath.endsWith(anchorSuffix)) continue;
+      const target = localPath.slice(0, localPath.length - anchorSuffix.length);
+      if (!target || target === expectedCurrentPath) continue;
+      // Only a folder that is new on both sides: not tracked, not on Drive, and
+      // not the destination of another rename.
+      if (hasPathOrDescendant(snapshotLocalIndex, target)) continue;
+      if (snapshotRemoteByPath.has(target) || remoteFolderPaths.has(target)) continue;
+      if (locallyRenamedFolders.some((rename) => rename.to === target)) continue;
+      targets.add(target);
+    }
+
+    const moved = [...targets].filter((target) =>
+      descendants.every(([oldPath, oldMeta]) => {
+        const current = localFilesData[`${target}${relativeToFolder(oldPath)}`];
+        if (!current) return false;
+        return oldMeta.isFolder || oldMeta.md5 === current.md5;
+      })
+    );
+    return moved.length === 1 ? moved[0] : null;
+  };
+
   for (const { fileId, snapshotEntry, from } of snapshotFolderCandidates) {
     if (!from || localFolderPaths.has(from)) continue;
     const expectedCurrentPath = applyLocalFolderRenames(
@@ -1016,7 +1072,6 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
       if (hasPathOrDescendant(snapshotLocalIndex, candidate)) return false;
       return !locallyRenamedFolders.some((rename) => candidate === rename.to);
     });
-    if (cheapCandidates.length === 0) continue;
     const descendants = snapshotLocalEntries.filter(([candidate]) =>
       candidate.startsWith(`${from}/`)
     );
@@ -1049,6 +1104,10 @@ export function computeDiff(snapshot, remoteFiles, localFiles, { root, respectIg
         sameDescendantFileHashes(descendants, candidate, localFileEntries)
       );
     });
+    if (candidates.length === 0) {
+      const movedTo = findMovedFolderTarget(expectedCurrentPath, descendants);
+      if (movedTo) candidates.push(movedTo);
+    }
     if (candidates.length === 1) {
       const to = candidates[0];
       const remoteFolder = fileId ? remoteById.get(fileId) : null;
