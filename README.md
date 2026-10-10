@@ -124,6 +124,19 @@ usage, conflict counts, and timings. Baseline saves are recorded separately.
 Completed runs use `<run-id>.jsonl`; running or interrupted runs use
 `<run-id>.active.jsonl`. The next run removes completed logs beyond the newest
 20 files or seven days, and abandoned active files older than seven days.
+
+A run's log is limited to 5 MiB. A very large sync fills it with operation
+records and then logs `log.limit_reached`; from there only the outcome events
+are kept. Read a run's totals from its `sync.finished` event, and see
+`droppedRecords` on `run.finished` for how many records were left out. The
+number of `operation.completed` lines in a truncated log is not the total.
+
+`aethel status` takes no lock, so while a push or pull is applying changes it
+can read a half-applied state. It prints a notice on stderr when it finds the
+workspace lock held. Drive requests that fail with a rate limit (HTTP 429, or
+403 with `userRateLimitExceeded`/`rateLimitExceeded`) are retried with backoff,
+up to eight attempts, before the operation is reported as failed and kept
+staged for the next run.
 Each file is capped at 5 MiB, with space reserved for its final outcome.
 After the cap is reached, intermediate events are omitted and
 `log.limit_reached` records the omission.

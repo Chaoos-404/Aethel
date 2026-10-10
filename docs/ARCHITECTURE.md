@@ -227,8 +227,13 @@ record; it must not be interpreted as successful completion.
 
 Retention runs at creation and completion. Completed files are limited to 20
 and seven days; active files expire after seven days. Each run is limited to
-5 MiB with a reserved terminal record. Diagnostic I/O errors are isolated from
-sync errors. Logs are local to `.aethel` and are excluded from synchronization.
+5 MiB with a reserved terminal record. Once the limit is reached, per-operation
+records are dropped; the outcome events (`sync.started`, `sync.finished`,
+`execution.checkpointed`, `baseline.saved`, `run.error`) still use the reserved
+space, and `run.finished` carries `droppedRecords`. Totals for a large run come
+from `sync.finished`, not from counting `operation.completed` lines. Diagnostic
+I/O errors are isolated from sync errors. Logs are local to `.aethel` and are
+excluded from synchronization.
 
 ## 5. Relationship Between TUI and CLI
 
