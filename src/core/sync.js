@@ -5,6 +5,7 @@ import {
   downloadFile,
   ensureFolder,
   findRemoteItemByPath,
+  resetFolderLookupCache,
   trashFile,
   uploadFile,
 } from "./drive-api.js";
@@ -581,11 +582,46 @@ async function renameRemoteFolder(drive, entry, driveFolderId) {
     );
   }
 
-  await drive.files.update({
+  const destinationPath = entry.remotePath || entry.path;
+  const update = {
     fileId,
-    requestBody: { name: path.posix.basename(entry.remotePath || entry.path) },
+    requestBody: { name: path.posix.basename(destinationPath) },
     fields: "id,name",
-  });
+  };
+
+  // A folder moved under a different parent changes its parent as well as its
+  // name; updating the name alone would leave it where it was.
+  const movesParent =
+    entry.sourcePath && parentPathOf(entry.sourcePath) !== parentPathOf(destinationPath);
+  if (movesParent) {
+    const destinationParentId = await ensureFolder(
+      drive,
+      parentPathOf(destinationPath),
+      driveFolderId
+    );
+    const current = await drive.files.get({
+      fileId,
+      fields: "id,parents",
+      supportsAllDrives: true,
+    });
+    const oldParentIds = (current.data?.parents || []).filter((id) => id !== destinationParentId);
+    if (oldParentIds.length > 0 || !(current.data?.parents || []).includes(destinationParentId)) {
+      update.addParents = destinationParentId;
+      if (oldParentIds.length > 0) update.removeParents = oldParentIds.join(",");
+      update.supportsAllDrives = true;
+      update.fields = "id,name,parents";
+    }
+  }
+
+  await drive.files.update(update);
+  // The memoized folder IDs are keyed by parent and name, so the old location
+  // would keep resolving to the folder that has just left it.
+  if (movesParent) resetFolderLookupCache();
+}
+
+function parentPathOf(pathValue) {
+  const parent = path.posix.dirname(String(pathValue || ""));
+  return parent === "." ? "" : parent;
 }
 
 function remapPathAfterRename(pathValue, fromPath, toPath) {

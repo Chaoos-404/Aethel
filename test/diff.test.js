@@ -1981,3 +1981,157 @@ test("computeDiff tells local cleanup which ancestor a remotely deleted file lea
     [{ type: ChangeType.REMOTE_DELETED, path: "docs/sub/x.txt", retainDirectory: "docs/sub" }]
   );
 });
+
+// A folder moved under a different parent has no sibling to be recognised by.
+// It counts as a move only when the files that are now somewhere new are exactly
+// the files the baseline tracked there, byte for byte; anything less keeps the
+// safe behaviour (deletions plus uploads) instead of renaming the wrong folder.
+
+function syncedWorkspace(contents) {
+  const files = {};
+  const localFiles = {};
+  const remoteFiles = [];
+  for (const [filePath, md5] of Object.entries(contents)) {
+    const id = `id:${filePath}`;
+    files[id] = { id, path: filePath, localPath: filePath, md5Checksum: md5 };
+    localFiles[filePath] = { localPath: filePath, md5 };
+    remoteFiles.push({ id, path: filePath, md5Checksum: md5 });
+  }
+  return { snapshot: { files, localFiles }, remoteFiles };
+}
+
+function describeChanges(diff) {
+  return diff.changes.map(({ changeType, path, sourcePath }) =>
+    sourcePath ? `${changeType} ${path} <- ${sourcePath}` : `${changeType} ${path}`
+  );
+}
+
+function localTree(contents) {
+  return Object.fromEntries(
+    Object.entries(contents).map(([filePath, md5]) => [filePath, { localPath: filePath, md5 }])
+  );
+}
+
+const COURSES = {
+  "courses/ee/a.pdf": "md5-a",
+  "courses/ee/sub/b.pdf": "md5-b",
+  "courses/other.pdf": "md5-other",
+  "keep.txt": "md5-keep",
+};
+
+test("computeDiff recognises a folder moved to a new parent as one rename", () => {
+  const { snapshot, remoteFiles } = syncedWorkspace(COURSES);
+  const diff = computeDiff(snapshot, remoteFiles, localTree({
+    "archive/ee/a.pdf": "md5-a",
+    "archive/ee/sub/b.pdf": "md5-b",
+    "courses/other.pdf": "md5-other",
+    "keep.txt": "md5-keep",
+  }));
+
+  assert.deepEqual(describeChanges(diff), [`${ChangeType.LOCAL_RENAMED} archive/ee <- courses/ee`]);
+  assert.equal(diff.changes[0].suggestedAction, "rename_remote");
+});
+
+test("computeDiff recognises a folder that is moved and renamed at once", () => {
+  const { snapshot, remoteFiles } = syncedWorkspace(COURSES);
+  const diff = computeDiff(snapshot, remoteFiles, localTree({
+    "archive/2026/electronics/a.pdf": "md5-a",
+    "archive/2026/electronics/sub/b.pdf": "md5-b",
+    "courses/other.pdf": "md5-other",
+    "keep.txt": "md5-keep",
+  }));
+
+  assert.deepEqual(describeChanges(diff), [
+    `${ChangeType.LOCAL_RENAMED} archive/2026/electronics <- courses/ee`,
+  ]);
+});
+
+test("computeDiff recognises a folder moved into an already tracked folder", () => {
+  const { snapshot, remoteFiles } = syncedWorkspace({ ...COURSES, "archive/old.pdf": "md5-old" });
+  const diff = computeDiff(snapshot, remoteFiles, localTree({
+    "archive/old.pdf": "md5-old",
+    "archive/ee/a.pdf": "md5-a",
+    "archive/ee/sub/b.pdf": "md5-b",
+    "courses/other.pdf": "md5-other",
+    "keep.txt": "md5-keep",
+  }));
+
+  assert.deepEqual(describeChanges(diff), [`${ChangeType.LOCAL_RENAMED} archive/ee <- courses/ee`]);
+});
+
+test("computeDiff keeps deletions plus uploads when a moved folder was also edited", () => {
+  const { snapshot, remoteFiles } = syncedWorkspace(COURSES);
+  const diff = computeDiff(snapshot, remoteFiles, localTree({
+    "archive/ee/a.pdf": "md5-a-edited",
+    "archive/ee/sub/b.pdf": "md5-b",
+    "courses/other.pdf": "md5-other",
+    "keep.txt": "md5-keep",
+  }));
+
+  // The edited folder is not renamed, so its edited file is uploaded anew and the
+  // old folder deleted. Its untouched subfolder is still a move of its own.
+  assert.deepEqual(describeChanges(diff).sort(), [
+    `${ChangeType.LOCAL_ADDED} archive/ee/a.pdf`,
+    `${ChangeType.LOCAL_DELETED} courses/ee`,
+    `${ChangeType.LOCAL_RENAMED} archive/ee/sub <- courses/ee/sub`,
+  ]);
+});
+
+test("computeDiff does not guess when the moved content exists in two new places", () => {
+  const { snapshot, remoteFiles } = syncedWorkspace(COURSES);
+  const diff = computeDiff(snapshot, remoteFiles, localTree({
+    "archive/ee/a.pdf": "md5-a",
+    "archive/ee/sub/b.pdf": "md5-b",
+    "backup/ee/a.pdf": "md5-a",
+    "backup/ee/sub/b.pdf": "md5-b",
+    "courses/other.pdf": "md5-other",
+    "keep.txt": "md5-keep",
+  }));
+
+  assert.ok(!describeChanges(diff).some((line) => line.startsWith(ChangeType.LOCAL_RENAMED)));
+});
+
+test("computeDiff does not move a folder onto a path that already exists on Drive", () => {
+  const { snapshot, remoteFiles } = syncedWorkspace(COURSES);
+  // Another device created archive/ee after the baseline was saved.
+  remoteFiles.push({ id: "id:archive/ee/theirs.pdf", path: "archive/ee/theirs.pdf", md5Checksum: "md5-theirs" });
+  const diff = computeDiff(snapshot, remoteFiles, localTree({
+    "archive/ee/a.pdf": "md5-a",
+    "archive/ee/sub/b.pdf": "md5-b",
+    "courses/other.pdf": "md5-other",
+    "keep.txt": "md5-keep",
+  }));
+
+  // archive/ee exists on Drive already, so courses/ee is not renamed onto it. Its
+  // subfolder has no counterpart there and still moves into it.
+  const lines = describeChanges(diff);
+  assert.ok(!lines.includes(`${ChangeType.LOCAL_RENAMED} archive/ee <- courses/ee`));
+  assert.ok(lines.includes(`${ChangeType.LOCAL_RENAMED} archive/ee/sub <- courses/ee/sub`));
+  assert.ok(lines.includes(`${ChangeType.LOCAL_ADDED} archive/ee/a.pdf`));
+});
+
+test("computeDiff does not treat a copy as a move while the original is still there", () => {
+  const { snapshot, remoteFiles } = syncedWorkspace(COURSES);
+  const diff = computeDiff(snapshot, remoteFiles, localTree({
+    ...COURSES,
+    "archive/ee/a.pdf": "md5-a",
+    "archive/ee/sub/b.pdf": "md5-b",
+  }));
+
+  assert.deepEqual(describeChanges(diff).sort(), [
+    `${ChangeType.LOCAL_ADDED} archive/ee/a.pdf`,
+    `${ChangeType.LOCAL_ADDED} archive/ee/sub/b.pdf`,
+  ]);
+});
+
+test("computeDiff still renames a sibling folder, which needs no content search", () => {
+  const { snapshot, remoteFiles } = syncedWorkspace(COURSES);
+  const diff = computeDiff(snapshot, remoteFiles, localTree({
+    "courses/electronics/a.pdf": "md5-a",
+    "courses/electronics/sub/b.pdf": "md5-b",
+    "courses/other.pdf": "md5-other",
+    "keep.txt": "md5-keep",
+  }));
+
+  assert.deepEqual(describeChanges(diff), [`${ChangeType.LOCAL_RENAMED} courses/electronics <- courses/ee`]);
+});

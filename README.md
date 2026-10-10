@@ -94,6 +94,12 @@ this device has not applied retain their previous baseline, including renames
 and deletions from another device. Normal commands refresh Drive observations
 before comparing changes.
 
+A folder you rename or move to another parent is recognised from its unchanged
+files and renamed on Drive, keeping its files in place, instead of being deleted
+and uploaded again. If any file was edited, or the same content shows up in
+several new places, Aethel does not guess: it falls back to deletions plus
+uploads.
+
 Scheduled `pull` and `push` runs can use `--non-interactive` to prevent browser
 authentication. Without `--force`, conflicts remain unresolved while unrelated
 changes can proceed; the command exits with code 2 when conflicts are detected.
