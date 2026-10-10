@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.1 (2026-10-10)
+
+- Record folders emptied by a sync so deleting them locally is pushed; rename folders moved under a different parent instead of re-uploading them; retry Drive rate limits; keep sync outcomes in truncated run logs; warn from status during a sync; make aethel rm stage Drive-only empty folders
+
 ## 1.4.0 (2026-10-06)
 
 - Protect unsynced local work during sync: remote folder deletions and renames no longer read as local additions, deletions from Drive and downloads refuse to destroy local files Drive does not have, and pull --all keeps locally edited files unless --force is given
