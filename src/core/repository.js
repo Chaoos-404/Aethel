@@ -19,7 +19,7 @@ import {
   writeConfig,
   writeSnapshot,
 } from "./config.js";
-import { advanceBaseline } from "./baseline.js";
+import { advanceBaseline, buildRemoteCoverage } from "./baseline.js";
 import { commitWorkspace } from "./commit-coordinator.js";
 import { withWorkspaceLock } from "./workspace-lock.js";
 import { logEvent, withRunLog } from "./logger.js";
@@ -64,29 +64,6 @@ import {
   listLocalEntries,
   renameLocalEntry,
 } from "./local-fs.js";
-
-/**
- * Paths covered by Drive: every remote path plus each of its ancestors.
- *
- * Build once instead of scanning the whole remote list per local file.
- */
-function buildRemoteCoverage(remoteFiles) {
-  const covered = new Set();
-
-  for (const file of remoteFiles || []) {
-    const pathValue = file?.path;
-    if (!pathValue) continue;
-
-    covered.add(pathValue);
-    const parts = pathValue.split("/");
-    while (parts.length > 1) {
-      parts.pop();
-      covered.add(parts.join("/"));
-    }
-  }
-
-  return covered;
-}
 
 /**
  * Keep only local baseline entries that are backed by a Drive item.

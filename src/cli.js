@@ -1593,9 +1593,11 @@ async function handleRm(paths, options) {
   const { diff } = await loadStateWithProgress(repo);
   const root = repo.root;
 
-  for (const targetPath of paths) {
+  for (const requestedPath of paths) {
+    const targetPath = requestedPath.replace(/\/+$/, "");
     const localAbs = assertInsideRoot(root, targetPath);
-    if (fs.existsSync(localAbs)) {
+    const existedLocally = fs.existsSync(localAbs);
+    if (existedLocally) {
       await fs.promises.rm(localAbs, { recursive: true });
       console.log(`  Deleted locally: ${targetPath}`);
     }
@@ -1610,9 +1612,34 @@ async function handleRm(paths, options) {
         suggestedAction: "delete_remote",
       });
       console.log(`  Staged remote deletion: ${targetPath}`);
-    } else {
+      continue;
+    }
+
+    // Drive lists only the empty leaf folders of a branch, never the folder
+    // above them, so a Drive-only folder has no change of its own to match.
+    // When every change below it is such an empty folder, trash the folder
+    // itself (the executor finds it by path) rather than reporting success.
+    const below = diff.changes.filter((c) => c.path.startsWith(`${targetPath}/`));
+    if (
+      !existedLocally &&
+      below.length > 0 &&
+      below.every((c) => c.changeType === ChangeType.REMOTE_ADDED && c.remoteMeta?.isFolder)
+    ) {
+      repo.stageChange({
+        changeType: ChangeType.LOCAL_DELETED,
+        path: targetPath,
+        remoteMeta: { path: targetPath, isFolder: true },
+        suggestedAction: "delete_remote",
+      });
+      console.log(`  Staged remote deletion: ${targetPath} (${below.length} empty folder(s) on Drive)`);
+    } else if (existedLocally || below.length > 0) {
       // After local delete, rescan will pick it up as local_deleted
       console.log(`  Removed: ${targetPath} (re-run 'aethel status' to see changes)`);
+    } else {
+      console.error(
+        `  Nothing to remove: ${targetPath} is not a local path and has no pending change on Drive`
+      );
+      process.exitCode = 1;
     }
   }
 }

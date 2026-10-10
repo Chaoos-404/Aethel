@@ -290,7 +290,7 @@ Processes deepest-first for single-pass convergence, caches child state to minim
 | `resolve` | Choose local, remote, or both for conflicts |
 | `log` / `show` / `rev-parse` | Inspect saved snapshots |
 | `branch` / `switch` / `checkout` / `tag` | Name and switch snapshot refs |
-| `rm` / `mv` | Git-like local remove and rename helpers |
+| `rm` / `mv` | Git-like local remove and rename helpers; `rm` also stages the deletion of a Drive-only folder that holds only empty folders |
 | `ignore` / `clean --ignored` | Manage ignored paths and remove ignored files from Drive |
 | `verify` | Check local and optional remote integrity |
 | `dedupe-folders` / `dedupe-files` | Clean up duplicate Drive entries |
