@@ -34,13 +34,45 @@ const SCOPED_FETCH_MAX_SNAPSHOT_FILES = readPositiveIntEnv(
 const UPLOAD_BATCH_SIZE = DRIVE_API_CONCURRENCY;
 const DEDUPE_BATCH_SIZE = DRIVE_API_CONCURRENCY;
 
-// Retry with exponential backoff for transient Drive API errors (429, 5xx).
+// Retry with exponential backoff for transient Drive API errors (429, 5xx and
+// the 403 Drive answers with when a quota is exceeded).
 const RETRY_MAX_ATTEMPTS = 5;
+// Throttling is the one failure that clears by waiting, and a bulk transfer
+// meets it in bursts, so it is retried for longer than a server hiccup.
+const RATE_LIMIT_MAX_ATTEMPTS = 8;
 const RETRY_BASE_DELAY_MS = 500;
+const RETRY_MAX_DELAY_MS = 30_000;
+const RATE_LIMIT_REASONS = new Set([
+  "userRateLimitExceeded",
+  "rateLimitExceeded",
+  "sharingRateLimitExceeded",
+]);
+
+/**
+ * Drive reports request throttling as HTTP 403 with a reason, not as 429.
+ * Other 403s (permissions, a full account, the daily quota) do not clear by
+ * waiting and must still fail at once.
+ */
+function isRateLimitError(err) {
+  const status = err?.response?.status ?? err?.code;
+  if (status === 429) return true;
+  if (status !== 403) return false;
+  const details = [err?.errors, err?.response?.data?.error?.errors]
+    .filter(Array.isArray)
+    .flat();
+  if (details.some((detail) => RATE_LIMIT_REASONS.has(detail?.reason))) return true;
+  return /rate limit exceeded/i.test(String(err?.message || ""));
+}
 
 function isRetryableError(err) {
   const status = err?.response?.status ?? err?.code;
-  return status === 429 || status === 500 || status === 502 || status === 503;
+  return (
+    status === 429 ||
+    status === 500 ||
+    status === 502 ||
+    status === 503 ||
+    isRateLimitError(err)
+  );
 }
 
 function getRetryDelay(err, attempt) {
@@ -52,7 +84,10 @@ function getRetryDelay(err, attempt) {
       return seconds * 1000;
     }
   }
-  return RETRY_BASE_DELAY_MS * Math.pow(2, attempt) * (0.5 + Math.random());
+  return Math.min(
+    RETRY_MAX_DELAY_MS,
+    RETRY_BASE_DELAY_MS * Math.pow(2, attempt) * (0.5 + Math.random())
+  );
 }
 
 async function withRetry(fn) {
@@ -60,7 +95,8 @@ async function withRetry(fn) {
     try {
       return await fn();
     } catch (err) {
-      if (!isRetryableError(err) || attempt >= RETRY_MAX_ATTEMPTS - 1) {
+      const maxAttempts = isRateLimitError(err) ? RATE_LIMIT_MAX_ATTEMPTS : RETRY_MAX_ATTEMPTS;
+      if (!isRetryableError(err) || attempt >= maxAttempts - 1) {
         throw err;
       }
       await new Promise((r) => setTimeout(r, getRetryDelay(err, attempt)));
@@ -92,7 +128,7 @@ function retryNamespace(namespace) {
 /**
  * Return a thin wrapper around a googleapis drive client whose
  * `files.*`, `changes.*` and `about.*` methods automatically retry on
- * 429 / 5xx. The original object is not mutated.
+ * 429 / 5xx and on rate-limit 403s. The original object is not mutated.
  */
 export function withDriveRetry(drive) {
   const descriptors = {
