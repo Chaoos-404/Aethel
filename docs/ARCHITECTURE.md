@@ -174,6 +174,19 @@ are converted into `delete_remote` operations, collapsed to the highest missing
 local ancestor, and deduplicated so removed folder trees are pruned in one pass.
 - Pack conflict -> `resolve_pack`
 
+A local folder that disappeared is renamed on Drive instead of being deleted
+and uploaded again when its tracked files turn up unchanged at a new folder.
+Beside the old folder, a sibling rename tolerates edits (at least half of the
+files unchanged, or the same set of file contents). Under a different parent the
+bar is higher, because nothing but content links the two folders: every tracked
+file must be present at the same relative path with the same hash, in exactly one
+folder that is new locally, not in the baseline and not on Drive. An edit made
+while moving, content found in two new places, or a destination that already
+exists on Drive leaves the folder as deletions plus uploads, which is always
+safe. The executor changes the Drive folder's parent as well as its name and
+creates any missing destination folders; deletions of the old parent run after
+the rename, and are refused if the rename failed.
+
 ### 4.3 Execution Model
 
 `commit` is not a Git commit. It executes the synchronization actions currently staged:
