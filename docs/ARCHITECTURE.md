@@ -200,6 +200,14 @@ Metadata moves carry the previous content hashes to the new paths, so pending
 content edits remain visible. Transfers advance only matching local and remote
 content; deletions advance only their completed scope.
 
+A deletion or move can also leave a folder empty on both sides: Drive keeps
+empty folders, and the executor prunes only the ones Drive lost. Such a folder
+was known only through its files, so the baseline also records each vacated
+ancestor that the local scan and Drive both hold as an empty folder (Drive
+lists only the leaf of an empty branch, so only the leaf gets a remote entry).
+Without that record, deleting the folder locally would read as a folder that is
+new on Drive, and no deletion could be pushed.
+
 Normal sync and status commands refresh remote observations, using the Drive
 memo and changes feed where available. The observation cache and the per-device
 sync baseline have separate purposes and must not replace one another.

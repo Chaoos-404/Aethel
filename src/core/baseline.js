@@ -1,4 +1,27 @@
 /**
+ * Paths covered by Drive: every remote path plus each of its ancestors.
+ *
+ * Build once instead of scanning the whole remote list per local file.
+ */
+export function buildRemoteCoverage(remoteFiles) {
+  const covered = new Set();
+
+  for (const file of remoteFiles || []) {
+    const pathValue = file?.path;
+    if (!pathValue) continue;
+
+    covered.add(pathValue);
+    const parts = pathValue.split("/");
+    while (parts.length > 1) {
+      parts.pop();
+      covered.add(parts.join("/"));
+    }
+  }
+
+  return covered;
+}
+
+/**
  * Advance only executed operations. A fresh Drive inventory is an observation,
  * not evidence that the device applied every change represented by it.
  */
@@ -93,6 +116,36 @@ export function advanceBaseline(previous, remoteFiles, scannedLocal, appliedChan
       if (!carriedLocal[ancestor]?.isFolder) continue;
       if (Object.keys(currentLocal).some(pathValue => under(pathValue, ancestor))) continue;
       delete carriedLocal[ancestor];
+    }
+  }
+  // The opposite case: a deletion or move can empty a folder that survives on
+  // both sides, because Drive keeps empty folders and the executor prunes only
+  // the ones Drive lost. Until now the baseline knew such a folder only through
+  // the files it held, so once they were gone it knew nothing of it. When the
+  // folder is later deleted locally, Drive's listing now carries it as an
+  // explicit empty folder with no baseline entry to be a deletion of, and it
+  // reads as new on Drive — a deletion that can never be pushed. Record every
+  // vacated ancestor that disk and Drive both hold as an empty folder, exactly
+  // as an initial sync would have recorded it.
+  const coveredByRemote = buildRemoteCoverage(remoteFiles);
+  for (const change of appliedChanges) {
+    const kind = action(change);
+    let origin = null;
+    if (kind === "move_local" || kind === "rename_remote") origin = change.sourcePath;
+    else if (kind === "delete_local" || kind === "delete_remote") origin = remap(change.localPath || change.path);
+    if (typeof origin !== "string") continue;
+    for (let slash = origin.lastIndexOf("/"); slash > 0; slash = origin.lastIndexOf("/", slash - 1)) {
+      const ancestor = origin.slice(0, slash);
+      const scanned = currentLocal[ancestor];
+      if (!scanned?.isFolder || !coveredByRemote.has(ancestor)) continue;
+      carriedLocal[ancestor] = scanned;
+      // Drive lists only the leaf of an empty branch; its parents are implied.
+      const listed = currentByPath.get(ancestor);
+      if (!listed?.isFolder) continue;
+      for (const [id, old] of remote) {
+        if (id !== listed.id && (old.path || old.localPath) === listed.path) remote.delete(id);
+      }
+      remote.set(listed.id, { ...listed, localPath: ancestor });
     }
   }
   return {

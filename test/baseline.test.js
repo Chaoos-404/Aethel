@@ -159,3 +159,89 @@ test("a local folder deletion forgets the emptied parent folder that is gone fro
   assert.deepEqual(next.local.files, {});
   assert.deepEqual(next.remote, []);
 });
+
+// The reverse of the cases above: the emptied folder survives on both sides.
+// Its baseline entry has to appear now, or deleting it later reads as a folder
+// that is new on Drive (it has no entry to be a deletion of).
+
+function nestedFilePrevious() {
+  return {
+    files: { a: remoteFile("a", "docs/sub/a.txt", "a0") },
+    localFiles: { "docs/sub/a.txt": localFile("docs/sub/a.txt", "a0") },
+  };
+}
+
+test("a remote deletion that empties a folder records the folder and its empty parent", () => {
+  const next = advanceBaseline(
+    nestedFilePrevious(),
+    [{ id: "sub", path: "docs/sub", isFolder: true }],
+    { files: {
+      docs: { localPath: "docs", isFolder: true },
+      "docs/sub": { localPath: "docs/sub", isFolder: true },
+    } },
+    [{ action: "delete_remote", path: "docs/sub/a.txt", fileId: "a" }]
+  );
+
+  assert.deepEqual(Object.keys(next.local.files).sort(), ["docs", "docs/sub"]);
+  assert.ok(next.local.files["docs/sub"].isFolder);
+  // Drive lists only the leaf of an empty branch, so only the leaf has an ID.
+  assert.deepEqual(next.remote.map(entry => [entry.id, entry.path]), [["sub", "docs/sub"]]);
+});
+
+test("a local deletion applied from Drive records the empty folder it leaves behind", () => {
+  const next = advanceBaseline(
+    nestedFilePrevious(),
+    [{ id: "sub", path: "docs/sub", isFolder: true }],
+    { files: {
+      docs: { localPath: "docs", isFolder: true },
+      "docs/sub": { localPath: "docs/sub", isFolder: true },
+    } },
+    [{ action: "delete_local", path: "docs/sub/a.txt", fileId: "a" }]
+  );
+
+  assert.ok(next.local.files["docs/sub"].isFolder);
+  assert.equal(next.remote.find(entry => entry.id === "sub").path, "docs/sub");
+});
+
+test("a deletion does not record a folder that still holds files", () => {
+  const previous = nestedFilePrevious();
+  previous.files.b = remoteFile("b", "docs/sub/b.txt", "b0");
+  previous.localFiles["docs/sub/b.txt"] = localFile("docs/sub/b.txt", "b0");
+  const next = advanceBaseline(
+    previous,
+    [previous.files.b],
+    { files: { "docs/sub/b.txt": previous.localFiles["docs/sub/b.txt"] } },
+    [{ action: "delete_remote", path: "docs/sub/a.txt", fileId: "a" }]
+  );
+
+  assert.deepEqual(Object.keys(next.local.files), ["docs/sub/b.txt"]);
+  assert.deepEqual(next.remote.map(entry => entry.id), ["b"]);
+});
+
+test("a deletion does not record an emptied folder that Drive no longer has", () => {
+  const next = advanceBaseline(
+    nestedFilePrevious(),
+    [],
+    { files: { docs: { localPath: "docs", isFolder: true }, "docs/sub": { localPath: "docs/sub", isFolder: true } } },
+    [{ action: "delete_remote", path: "docs/sub/a.txt", fileId: "a" }]
+  );
+
+  assert.deepEqual(next.local.files, {});
+  assert.deepEqual(next.remote, []);
+});
+
+test("a folder emptied by an unrelated change is not recorded", () => {
+  const previous = createPreviousSnapshot();
+  const next = advanceBaseline(
+    previous,
+    [{ id: "empty", path: "empty", isFolder: true }, previous.files.b],
+    { files: {
+      "b.txt": previous.localFiles["b.txt"],
+      empty: { localPath: "empty", isFolder: true },
+    } },
+    [{ action: "delete_remote", path: "a.txt", fileId: "a" }]
+  );
+
+  assert.equal(next.local.files.empty, undefined);
+  assert.equal(next.remote.find(entry => entry.id === "empty"), undefined);
+});

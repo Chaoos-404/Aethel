@@ -19,6 +19,8 @@ The synchronization tests are organized by responsibility:
 - `test/commit-coordinator.test.js`: partial execution and persistence recovery.
 - `test/workspace-lock.test.js`: process exclusion and lock release.
 - `test/two-device-sync.test.js`: rename, move, and deletion across two devices.
+- `test/empty-folder-sync.test.js`: empty folders created, emptied, renamed, and deleted
+  on either side.
 - `test/drive-api.test.js`: Drive operations and executor integration.
 - `test/logger.test.js` and `test/progress.test.js`: diagnostics and progress.
 

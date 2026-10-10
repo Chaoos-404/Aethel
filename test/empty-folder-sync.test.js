@@ -118,6 +118,74 @@ for (const scenario of LOCAL_SCENARIOS) {
   });
 }
 
+// A sync that empties a folder leaves it behind on both sides: Drive keeps
+// empty folders, and the local copy of one Drive still has is kept too. The
+// baseline only knew that folder through the files it held, so deleting it
+// afterwards looked like a folder that is new on Drive — `status` offered a
+// download, `push` had nothing to push, and the folder stayed on Drive forever.
+const EMPTIED_BY_SYNC_SCENARIOS = [
+  {
+    name: "a push that moved the last file out",
+    tree: ["keep.txt", "docs/sub/a.txt"],
+    emptyIt: async ({ device, repo }) => {
+      await fs.rename(path.join(device, "docs", "sub", "a.txt"), path.join(device, "moved.txt"));
+      const { diff } = await repo.loadState({ useCache: false });
+      repo.stageChanges(diff.localChanges);
+    },
+    deleted: "docs",
+  },
+  {
+    name: "a push that deleted the last file",
+    tree: ["keep.txt", "docs/sub/a.txt", "docs/other/b.txt"],
+    emptyIt: async ({ device, repo }) => {
+      await fs.rm(path.join(device, "docs", "sub", "a.txt"));
+      const { diff } = await repo.loadState({ useCache: false });
+      repo.stageChanges(diff.localChanges);
+    },
+    deleted: "docs/sub",
+  },
+  {
+    name: "a pull that applied a remote deletion of the last file",
+    tree: ["keep.txt", "docs/sub/a.txt", "docs/other/b.txt"],
+    emptyIt: async ({ drive, ids, repo, refreshRemote }) => {
+      await drive.files.update({ fileId: ids.get("docs/sub/a.txt"), requestBody: { trashed: true } });
+      await refreshRemote();
+      const { diff } = await repo.loadState({ useCache: false });
+      repo.stageChanges(diff.remoteChanges);
+    },
+    deleted: "docs/sub",
+  },
+];
+
+for (const scenario of EMPTIED_BY_SYNC_SCENARIOS) {
+  test(`empty folders: a folder emptied by ${scenario.name} is deleted locally and pushed`, async (t) => {
+    const fixture = await createFolderFixture(t, scenario.tree);
+    const { device, repo, refreshRemote } = fixture;
+
+    await scenario.emptyIt(fixture);
+    assert.deepEqual((await repo.commitStaged({ message: "empty the folder" })).errors, []);
+
+    await fs.rm(path.join(device, ...scenario.deleted.split("/")), { recursive: true });
+    const before = await repo.loadState({ useCache: false });
+    assert.deepEqual(
+      before.diff.changes.map((change) => `${change.changeType} ${change.path}`),
+      [`local_deleted ${scenario.deleted}`],
+      describeDiff(before.diff)
+    );
+
+    repo.stageChanges(before.diff.localChanges);
+    assert.deepEqual((await repo.commitStaged({ message: "push" })).errors, []);
+
+    assert.deepEqual(
+      await localDirectories(device),
+      remoteDirectories(await refreshRemote()),
+      "Drive must end up with the same folders as the local tree"
+    );
+    const after = await repo.loadState({ useCache: false });
+    assert.equal(after.diff.isClean, true, `diff must be clean after the push: ${describeDiff(after.diff)}`);
+  });
+}
+
 for (const scenario of SCENARIOS) {
   test(`empty folders: ${scenario.name}`, async (t) => {
     const fixture = await createFolderFixture(t, scenario.tree);
