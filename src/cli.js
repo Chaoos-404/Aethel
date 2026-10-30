@@ -178,8 +178,11 @@ function addAuthOptions(command) {
     .option("--token <path>", "Path to cached OAuth token JSON");
 }
 
-async function openRepo(options, { requireWorkspace = true, silent = false, connect = true } = {}) {
-  const root = requireWorkspace ? requireRoot() : null;
+async function openRepo(
+  options,
+  { requireWorkspace = true, silent = false, connect = true, detectWorkspace = false } = {}
+) {
+  const root = requireWorkspace ? requireRoot() : detectWorkspace ? findRoot() : null;
   const repo = await createRepository(root, {
     credentials: options.credentials,
     token: options.token,
@@ -1746,7 +1749,14 @@ async function handleVerify(options) {
 }
 
 async function handleTui(options) {
-  const repo = await openRepo(options, { requireWorkspace: false, silent: true });
+  // Fail before authenticating when the panel the user asked for cannot open.
+  if (options.sync) requireRoot();
+  // Inside a workspace the TUI also offers auto-sync; elsewhere it is a plain file browser.
+  const repo = await openRepo(options, {
+    requireWorkspace: false,
+    detectWorkspace: true,
+    silent: true,
+  });
   const { runTui } = await loadTuiModule();
   const cliArgs = [];
   if (options.credentials) {
@@ -1760,6 +1770,7 @@ async function handleTui(options) {
     includeSharedDrives: Boolean(options.sharedDrives),
     cliPath: path.resolve(process.argv[1]),
     cliArgs,
+    initialView: options.sync ? "sync" : "browser",
   });
 }
 
@@ -2140,6 +2151,7 @@ async function main() {
       .command("tui")
       .description("Launch the interactive Ink terminal UI")
       .option("--shared-drives", "Include shared drives")
+      .option("--sync", "Open the auto-sync and conflict resolution panel (inside a workspace)")
   ).action(handleTui);
 
   program.hook("preAction", (_command, actionCommand) => {

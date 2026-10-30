@@ -313,7 +313,7 @@ Processes deepest-first for single-pass convergence, caches child state to minim
 | `ignore` / `clean --ignored` | Manage ignored paths and remove ignored files from Drive |
 | `verify` | Check local and optional remote integrity |
 | `dedupe-folders` / `dedupe-files` | Clean up duplicate Drive entries |
-| `tui` | Open the interactive terminal UI |
+| `tui` | Open the interactive terminal UI; `tui --sync` opens the auto-sync panel |
 
 ### Git-Compatible Command Forms
 
@@ -376,6 +376,38 @@ pane immediately while Aethel reloads the authoritative Drive listing.
 | `f`                | Open the commands page and choose a TUI action     |
 | `:`                | Run any Aethel CLI command inside the TUI          |
 | `r`                | Reload local and Drive panes                       |
+| `w`                | Open the auto-sync and conflict panel (workspace)  |
+
+### Auto-sync panel
+
+Run `aethel tui` inside a workspace (or `aethel tui --sync` to open straight into
+it) and press `w`. The panel keeps the workspace in sync until you leave it:
+
+- **What it syncs.** Each cycle loads local and Drive state, stages every change
+  that happened on only one side — downloads, uploads, deletions, renames — and
+  commits them, like `status`, `add -A` and `commit` in one step. It runs when
+  the panel opens, when local files change, and every 15 s – 5 min (default
+  60 s) to pick up Drive changes.
+- **What it never decides.** Files changed on both sides are left untouched and
+  listed in the **Conflicts** panel, together with each side's size, modified
+  time and checksum. Changes beneath a conflicted folder wait with it.
+- **Needs a baseline.** Run `aethel pull --all` (or `aethel add -A && aethel commit`)
+  once first; the panel says so if the workspace has no snapshot yet.
+
+| Key                | Action                                                     |
+| ------------------ | ---------------------------------------------------------- |
+| `s`                | Sync now                                                   |
+| `p`                | Pause / resume automatic syncing                           |
+| `-` / `+`          | Shorter / longer polling interval                          |
+| `j` / `k`          | Select a conflict                                          |
+| `l` / `r` / `b`    | Resolve the selected conflict: keep local / Drive / both   |
+| `L` / `R` / `B`    | Resolve every conflict that way (asks to confirm)          |
+| `Esc`              | Back to the file browser (once a running sync finishes)    |
+
+Choosing a side runs the same resolution as `aethel resolve` (`--ours`, `--theirs`,
+`--both`) and applies it immediately. A choice is only offered when the side it
+keeps exists — you cannot keep the Drive copy of a file deleted on Drive.
+Pack conflicts are reported but still resolved with `aethel resolve`.
 
 ## Directory Packing
 

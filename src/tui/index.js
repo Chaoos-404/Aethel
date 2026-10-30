@@ -7,6 +7,7 @@ export async function runTui({
   includeSharedDrives = false,
   cliPath = null,
   cliArgs = [],
+  initialView = "browser",
 } = {}) {
   const instance = render(
     React.createElement(AethelTui, {
@@ -14,6 +15,7 @@ export async function runTui({
       includeSharedDrives,
       cliPath,
       cliArgs,
+      initialView,
     })
   );
   await instance.waitUntilExit();
