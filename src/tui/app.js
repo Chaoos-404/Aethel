@@ -16,27 +16,10 @@ import {
 } from "../core/local-fs.js";
 import { COMMAND_CATALOG } from "./command-catalog.js";
 import { parseCommandInput } from "./commands.js";
+import { scrollWindow, truncate } from "./layout.js";
+import { SyncView } from "./sync-view.js";
 
 const h = React.createElement;
-
-function truncate(value, width) {
-  if (value.length <= width) {
-    return value;
-  }
-
-  if (width <= 1) {
-    return value.slice(0, width);
-  }
-
-  return `${value.slice(0, width - 1)}…`;
-}
-
-function scrollWindow(length, cursor, height) {
-  return Math.min(
-    Math.max(cursor - Math.floor(height / 2), 0),
-    Math.max(length - height, 0)
-  );
-}
 
 function renderRemoteRow(file, isCursor, isSelected, width) {
   const mark = isSelected ? "[x]" : "[ ]";
@@ -145,6 +128,9 @@ function renderHelp() {
     h(Text, null, ""),
     h(Text, { color: "cyan" }, "Drive Pane"),
     h(Text, null, "  Space  Toggle select   a  Select all    t  Trash    d  Delete"),
+    h(Text, null, ""),
+    h(Text, { color: "cyan" }, "Sync"),
+    h(Text, null, "  w  Auto-sync and conflict panel (needs an Aethel workspace)"),
     h(Text, null, ""),
     h(Text, { color: "cyan" }, "Commands"),
     h(Text, null, "  f  Open command panel             :  Run CLI command directly"),
@@ -274,9 +260,13 @@ export function AethelTui({
   includeSharedDrives = false,
   cliPath = null,
   cliArgs = [],
+  initialView = "browser",
 }) {
   const { exit } = useApp();
-  const [mode, setMode] = useState("loading");
+  const syncAvailable = Boolean(repo.root);
+  const [mode, setMode] = useState(
+    initialView === "sync" && syncAvailable ? "sync" : "loading"
+  );
   const [remoteLoading, setRemoteLoading] = useState(true);
   const [focusPane, setFocusPane] = useState("local");
   const [account, setAccount] = useState(null);
@@ -402,7 +392,7 @@ export function AethelTui({
     try {
       await loadLocalPane(localDirectory);
       // Switch to normal mode so the user can browse local files while remote loads
-      setMode("normal");
+      setMode((current) => (current === "sync" ? current : "normal"));
       setStatus("Loading Drive files...");
     } catch (error) {
       setErrorMessage(error.message);
@@ -721,7 +711,7 @@ export function AethelTui({
       return;
     }
 
-    if (mode === "loading" || mode === "busy") {
+    if (mode === "loading" || mode === "busy" || mode === "sync") {
       return;
     }
 
@@ -1041,6 +1031,15 @@ export function AethelTui({
     if (input === ":") {
       openCommandEditor("", "normal");
       setStatus("Enter an Aethel command without `aethel`.");
+      return;
+    }
+
+    if (input === "w" || input === "W") {
+      if (!syncAvailable) {
+        setStatus("Auto-sync needs an Aethel workspace. Run `aethel init` in this directory first.");
+        return;
+      }
+      setMode("sync");
       return;
     }
 
@@ -1376,6 +1375,18 @@ export function AethelTui({
     );
   }
 
+  if (mode === "sync") {
+    return h(SyncView, {
+      repo,
+      width,
+      height,
+      onClose: () => {
+        setMode("normal");
+        void loadAllData("Closed auto-sync panel.", true);
+      },
+    });
+  }
+
   if (mode === "commands-page") {
     return h(
       Box,
@@ -1421,8 +1432,8 @@ export function AethelTui({
     hints = "j/k: scroll  Enter/Esc: close";
   } else {
     hints = focusPane === "local"
-      ? "u:upload  s:sync  n:rename  x:delete  /:filter  Tab:switch  f:Commands  ?:help  q:quit"
-      : "Space:select  a:all  t:trash  d:delete  /:filter  Tab:switch  f:Commands  ?:help  q:quit";
+      ? "u:upload  s:sync  n:rename  x:delete  /:filter  Tab:switch  w:sync  f:Commands  ?:help  q:quit"
+      : "Space:select  a:all  t:trash  d:delete  /:filter  Tab:switch  w:sync  f:Commands  ?:help  q:quit";
   }
 
   const headerRight = selectedCount > 0

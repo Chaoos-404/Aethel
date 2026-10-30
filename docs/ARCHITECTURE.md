@@ -25,6 +25,10 @@ The core design is not a live mirror between local storage and Drive. Instead, s
   - Starts the Ink TUI
 - `src/tui/app.js`
   - Implements dual-pane file browsing, filtering, uploads, deletion, and interactive operations
+- `src/tui/sync-view.js`
+  - Auto-sync panel (`w` in the TUI, `aethel tui --sync`): runs sync cycles on open, on local changes, and on an interval, and hosts the conflict resolution panel
+- `src/tui/layout.js`
+  - Shared text truncation and scroll-window helpers
 
 ### 2.2 Core Capability Layer
 
@@ -45,6 +49,11 @@ The core design is not a live mirror between local storage and Drive. Instead, s
   - Manages the staging area
 - `src/core/sync.js`
   - Executes staged operations
+- `src/core/workspace-watch.js`
+  - Watches the workspace for local changes folder by folder, skipping ignored folders and capping watcher count, so auto-sync can react without exhausting inotify watches
+- `src/core/auto-sync.js`
+  - One automatic sync cycle: stages one-sided local and Drive changes, commits them, and returns conflicts (and anything waiting on them) instead of resolving them
+  - Conflict helpers for the TUI: which choices apply, a side-by-side description, and staging a resolution
 - `src/core/config.js`
   - Manages `.aethel/` state files
 - `src/core/ignore.js`
